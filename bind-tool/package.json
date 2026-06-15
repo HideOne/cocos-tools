@@ -1,0 +1,77 @@
+{
+    "$schema": "./@types/schema/package/index.json",
+    "package_version": 2,
+    "name": "bind-tool",
+    "version": "1.0.0",
+    "author": "hideOne",
+    "editor": ">=3.8.7",
+    "scripts": {
+        "preinstall": "node ./scripts/preinstall.js",
+        "build": "tsc",
+        "watch": "tsc -w"
+    },
+    "description": "i18n:bind-tool.description",
+    "main": "./dist/main.js",
+    "panels": {
+        "rules": {
+            "title": "i18n:bind-tool.rules_panel",
+            "main": "./dist/panels/rules.js",
+            "type": "dockable",
+            "size": {
+                "min-width": 720,
+                "min-height": 420,
+                "width": 900,
+                "height": 620
+            }
+        }
+    },
+    "devDependencies": {
+        "@cocos/creator-types": "^3.8.7",
+        "@types/node": "^18.17.1",
+        "typescript": "^5.8.2"
+    },
+    "contributions": {
+        "menu": [
+            {
+                "path": "i18n:bind-tool.menu",
+                "label": "i18n:bind-tool.bind_selected_node",
+                "message": "bind-selected-node"
+            },
+            {
+                "path": "i18n:bind-tool.menu",
+                "label": "i18n:bind-tool.rules_panel",
+                "message": "open-rules-panel"
+            }
+        ],
+        "messages": {
+            "open-rules-panel": {
+                "methods": [
+                    "openRulesPanel"
+                ]
+            },
+            "query-config": {
+                "methods": [
+                    "queryConfig"
+                ],
+                "public": true
+            },
+            "save-config": {
+                "methods": [
+                    "saveConfig"
+                ],
+                "public": true
+            },
+            "reset-config": {
+                "methods": [
+                    "resetConfig"
+                ],
+                "public": true
+            },
+            "bind-selected-node": {
+                "methods": [
+                    "bindSelectedNode"
+                ]
+            }
+        }
+    }
+}
