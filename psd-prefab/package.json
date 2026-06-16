@@ -1,0 +1,40 @@
+{
+    "$schema": "../bind-tool/@types/schema/package/index.json",
+    "package_version": 2,
+    "name": "psd-prefab",
+    "version": "1.0.0",
+    "author": "hideOne",
+    "editor": ">=3.8.7",
+    "description": "i18n:psd-prefab.description",
+    "main": "./main.js",
+    "dependencies": {
+        "psd.js": "^3.4.0"
+    },
+    "contributions": {
+        "menu": [
+            {
+                "path": "i18n:psd-prefab.menu",
+                "label": "i18n:psd-prefab.convert_selected",
+                "message": "convert-selected-psd"
+            }
+        ],
+        "assets": {
+            "menu": {
+                "methods": "./asset-menu.js",
+                "assetMenu": "assetMenu"
+            }
+        },
+        "messages": {
+            "convert-selected-psd": {
+                "methods": [
+                    "convertSelectedPsd"
+                ]
+            },
+            "convert-psd-asset": {
+                "methods": [
+                    "convertPsdAsset"
+                ]
+            }
+        }
+    }
+}
