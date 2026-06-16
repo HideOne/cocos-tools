@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'fs';
 import { basename, extname, join, relative } from 'path';
+import { randomBytes } from 'crypto';
 
 const PACKAGE_NAME = 'bind-tool';
 
@@ -106,6 +107,17 @@ const defaultConfig: BindToolConfig = {
             generateClickEvent: true,
             enabled: true,
         },
+        {
+            prefix: 'label',
+            componentName: 'Label',
+            propertyType: 'Label',
+            decoratorType: 'Label',
+            bindTarget: 'component',
+            componentType: 'cc.Label',
+            stopChildren: false,
+            generateClickEvent: false,
+            enabled: true,
+        },
     ],
 };
 
@@ -193,6 +205,9 @@ async function bindSelectedNode(): Promise<BindResult> {
     const className = toClassName(nodeName);
     const config = await readConfig();
     const openedAssetUrl = await queryOpenedAssetUrl(selectedTree);
+    if (!openedAssetUrl) {
+        throw new Error('Cannot locate the opened prefab or scene asset. Please save the prefab/scene and run bind again.');
+    }
     const scriptUrl = makeScriptUrl(openedAssetUrl, className, config.scriptRoot);
     const scan = scanBindings(selectedTree, config);
     const buttons = scan.filter((item) => item.generateClickEvent);
@@ -210,12 +225,12 @@ async function bindSelectedNode(): Promise<BindResult> {
     await writeAsset(scriptUrl, finalSource, created);
     await Editor.Message.request('asset-db', 'refresh-asset', scriptUrl);
 
-    const componentAttached = await tryAttachComponent(selectedUuid, className);
+    const componentAttached = await tryAttachComponent(selectedUuid, className, scriptUrl);
     let propertiesBound = 0;
 
     try {
         await Editor.Message.request('scene', 'save-scene');
-        propertiesBound = await bindSerializedAssetReferences(openedAssetUrl, className, getNodeName(selectedTree), scan);
+        propertiesBound = await bindSerializedAssetReferences(openedAssetUrl, scriptUrl, selectedUuid, className, getNodeName(selectedTree), scan);
         if (openedAssetUrl) {
             await Editor.Message.request('asset-db', 'refresh-asset', openedAssetUrl);
         }
@@ -285,23 +300,37 @@ function normalizeRule(rule: any): BindRule | null {
 
 function normalizeComponentName(componentName: string): string {
     const value = componentName.trim();
-    if (value === 'cc.Node') {
-        return 'Node';
-    }
-
-    if (value === 'cc.Button') {
-        return 'Button';
+    if (value.startsWith('cc.')) {
+        return shortTypeName(value);
     }
 
     return value || 'Node';
 }
 
 function toComponentType(propertyType: string): string {
-    if (propertyType === 'Button') {
-        return 'cc.Button';
+    if (isBuiltinCcComponent(propertyType)) {
+        return `cc.${propertyType}`;
     }
 
     return propertyType;
+}
+
+function isBuiltinCcComponent(propertyType: string): boolean {
+    return [
+        'Button',
+        'EditBox',
+        'Label',
+        'Layout',
+        'Mask',
+        'PageView',
+        'ProgressBar',
+        'RichText',
+        'ScrollView',
+        'Slider',
+        'Sprite',
+        'Toggle',
+        'Widget',
+    ].includes(propertyType);
 }
 
 function isButtonType(propertyType: string): boolean {
@@ -312,14 +341,26 @@ async function queryOpenedAssetUrl(selectedTree: any): Promise<string | null> {
     try {
         const savedId = await Editor.Message.request('scene', 'save-scene');
         if (!savedId) {
-            return findAssetUrlByNodeTree(selectedTree);
+            return findAssetUrlByNodeTreeWithRetry(selectedTree);
         }
 
         const asset = await Editor.Message.request('asset-db', 'query-asset-info', savedId);
-        return asset?.url || asset?.source || findAssetUrlByNodeTree(selectedTree);
+        return asset?.url || asset?.source || findAssetUrlByNodeTreeWithRetry(selectedTree);
     } catch {
-        return findAssetUrlByNodeTree(selectedTree);
+        return findAssetUrlByNodeTreeWithRetry(selectedTree);
     }
+}
+
+async function findAssetUrlByNodeTreeWithRetry(selectedTree: any): Promise<string | null> {
+    for (let index = 0; index < 5; index += 1) {
+        const url = findAssetUrlByNodeTree(selectedTree);
+        if (url) {
+            return url;
+        }
+        await delay(120);
+    }
+
+    return null;
 }
 
 function findAssetUrlByNodeTree(selectedTree: any): string | null {
@@ -334,7 +375,7 @@ function findAssetUrlByNodeTree(selectedTree: any): string | null {
 
     for (const file of candidates) {
         try {
-            const data = JSON.parse(readFileSync(file, 'utf8'));
+            const data = readJsonFileSync(file);
             if (!Array.isArray(data)) {
                 continue;
             }
@@ -352,11 +393,43 @@ function findAssetUrlByNodeTree(selectedTree: any): string | null {
                 return `db://${assetRelative}`;
             }
         } catch (error) {
-            console.warn(`[${PACKAGE_NAME}] Failed to inspect asset ${file}.`, error);
+            if (!isIncompleteJsonError(error)) {
+                console.warn(`[${PACKAGE_NAME}] Failed to inspect asset ${file}.`, error);
+            }
         }
     }
 
     return null;
+}
+
+function readJsonFileSync(file: string): any | null {
+    try {
+        return JSON.parse(readFileSync(file, 'utf8'));
+    } catch (error) {
+        if (isIncompleteJsonError(error)) {
+            return null;
+        }
+        throw error;
+    }
+}
+
+async function readJsonFileWithRetry(file: string, attempts = 5): Promise<any | null> {
+    for (let index = 0; index < attempts; index += 1) {
+        try {
+            return JSON.parse(readFileSync(file, 'utf8'));
+        } catch (error) {
+            if (!isIncompleteJsonError(error) || index === attempts - 1) {
+                throw error;
+            }
+            await delay(120);
+        }
+    }
+
+    return null;
+}
+
+function isIncompleteJsonError(error: unknown): boolean {
+    return error instanceof SyntaxError && /Unexpected end of JSON input/.test(error.message);
 }
 
 function listAssetFiles(dir: string, extensions: string[]): string[] {
@@ -569,28 +642,40 @@ function renderCcImports(bindings: ScannedBinding[]): string {
         imports.add('Button');
     }
 
-    return [...imports].sort((left, right) => {
-        const order = ['_decorator', 'Component', 'Node', 'Button', 'sp'];
-        const leftIndex = order.indexOf(left);
-        const rightIndex = order.indexOf(right);
-        if (leftIndex !== -1 || rightIndex !== -1) {
-            return (leftIndex === -1 ? 99 : leftIndex) - (rightIndex === -1 ? 99 : rightIndex);
-        }
+    return sortCcImports(imports).join(', ');
+}
 
-        return left.localeCompare(right);
-    }).join(', ');
+function sortCcImports(imports: Iterable<string>): string[] {
+    return [...new Set(imports)]
+        .filter((item) => item && item !== 'cc')
+        .sort((left, right) => {
+            const order = ['_decorator', 'Component', 'Node', 'Button', 'Label', 'Sprite', 'Widget', 'sp'];
+            const leftIndex = order.indexOf(left);
+            const rightIndex = order.indexOf(right);
+            if (leftIndex !== -1 || rightIndex !== -1) {
+                return (leftIndex === -1 ? 99 : leftIndex) - (rightIndex === -1 ? 99 : rightIndex);
+            }
+
+            return left.localeCompare(right);
+        });
 }
 
 function collectImportFromType(imports: Set<string>, typeName: string): void {
-    const firstPart = typeName.trim().split('.')[0];
-    if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(firstPart)) {
-        imports.add(firstPart);
+    const value = typeName.trim();
+    const importName = value.startsWith('cc.') ? shortTypeName(value) : value.split('.')[0];
+    if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(importName)) {
+        imports.add(importName);
     }
 }
 
 function renderProperties(bindings: ScannedBinding[]): string {
-    return bindings.map((binding) => `    @property(${binding.decoratorType})
-    public ${binding.propertyName}: ${binding.propertyType} | null = null;`).join('\n\n');
+    return bindings.map((binding) => `    @property(${toScriptTypeName(binding.decoratorType)})
+    public ${binding.propertyName}: ${toScriptTypeName(binding.propertyType)} | null = null;`).join('\n\n');
+}
+
+function toScriptTypeName(typeName: string): string {
+    const value = typeName.trim();
+    return value.startsWith('cc.') ? shortTypeName(value) : value;
 }
 
 function renderButtonEvents(buttons: ScannedBinding[]): string {
@@ -625,7 +710,7 @@ function updateMarkedSource(existing: string, generated: string): string {
     let updated = replaceBlock(existing, bindMarkers[0], bindMarkers[1], bindBlock);
     updated = updated.replace(bindMarkers[0], AUTO_BIND_START).replace(bindMarkers[1], AUTO_BIND_END);
 
-    return replaceBlock(
+    const updatedBlocks = replaceBlock(
         replaceBlock(
             updated,
             AUTO_BUTTON_EVENT_START,
@@ -636,6 +721,8 @@ function updateMarkedSource(existing: string, generated: string): string {
         AUTO_BUTTON_HANDLER_END,
         handlerBlock,
     );
+
+    return mergeCcImports(updatedBlocks, generated);
 }
 
 function hasAllAutoBlocks(source: string): boolean {
@@ -664,6 +751,34 @@ function replaceBlock(source: string, start: string, end: string, content: strin
     return `${source.slice(0, startIndex + start.length)}${content}${source.slice(endIndex)}`;
 }
 
+function mergeCcImports(existing: string, generated: string): string {
+    const importPattern = /^import\s+\{\s*([^}]+?)\s*\}\s+from\s+['"]cc['"];\s*$/m;
+    const existingMatch = existing.match(importPattern);
+    const generatedMatch = generated.match(importPattern);
+
+    if (!generatedMatch) {
+        return existing;
+    }
+
+    if (!existingMatch) {
+        return `${generatedMatch[0]}\n${existing}`;
+    }
+
+    const merged = sortCcImports([
+        ...parseCcImportNames(existingMatch[1]),
+        ...parseCcImportNames(generatedMatch[1]),
+    ]);
+
+    return existing.replace(importPattern, `import { ${merged.join(', ')} } from 'cc';`);
+}
+
+function parseCcImportNames(imports: string): string[] {
+    return imports
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean);
+}
+
 async function readAssetText(url: string): Promise<string | null> {
     const asset = await Editor.Message.request('asset-db', 'query-asset-info', url);
     if (!asset?.file) {
@@ -682,37 +797,172 @@ async function writeAsset(url: string, source: string, created: boolean): Promis
     await Editor.Message.request('asset-db', 'save-asset', url, source);
 }
 
-async function tryAttachComponent(nodeUuid: string, className: string): Promise<boolean> {
+async function tryAttachComponent(nodeUuid: string, className: string, scriptUrl: string): Promise<boolean> {
     if (await findComponentUuid(nodeUuid, className)) {
         return true;
     }
 
-    try {
-        await Editor.Message.request('scene', 'create-component', {
-            uuid: nodeUuid,
-            component: className,
-        });
-        return true;
-    } catch (firstError) {
-        console.warn(`[${PACKAGE_NAME}] First component attach failed. Waiting for script import before retry.`, firstError);
+    const registeredCandidates = await waitForScriptComponentCandidates(className, scriptUrl);
+    if (registeredCandidates.length === 0) {
+        console.warn(`[${PACKAGE_NAME}] Script component ${className} was not registered yet. Trying to attach anyway.`);
     }
 
-    await delay(1000);
+    const componentCandidates = [...new Set([
+        className,
+        normalizeClassName(className),
+        ...registeredCandidates,
+    ].filter(Boolean))];
 
+    for (const componentName of componentCandidates) {
+        if (await createComponentAndVerify(nodeUuid, componentName, componentCandidates)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+async function waitForScriptComponentCandidates(className: string, scriptUrl: string): Promise<string[]> {
+    const deadline = Date.now() + 12000;
+    const scriptAsset = await queryAssetInfoSafe(scriptUrl);
+    const cachedCid = readScriptCidFromProgramCache(scriptAsset, className);
+    let logged = false;
+
+    while (Date.now() < deadline) {
+        const candidates = await queryRegisteredScriptComponentCandidates(className, scriptAsset);
+        if (candidates.length > 0) {
+            return [...new Set([...candidates, ...cachedCid])];
+        }
+
+        if (!logged) {
+            console.log(`[${PACKAGE_NAME}] Waiting for script import: ${className}`);
+            logged = true;
+        }
+
+        await delay(500);
+    }
+
+    return cachedCid;
+}
+
+async function queryAssetInfoSafe(url: string): Promise<any | null> {
+    try {
+        return await Editor.Message.request('asset-db', 'query-asset-info', url);
+    } catch {
+        return null;
+    }
+}
+
+async function queryRegisteredScriptComponentCandidates(className: string, scriptAsset: any | null): Promise<string[]> {
+    try {
+        const components = await Editor.Message.request('scene', 'query-components');
+        if (!Array.isArray(components)) {
+            return [];
+        }
+
+        const scriptUuid = scriptAsset?.uuid ? String(scriptAsset.uuid) : '';
+        const scriptUrl = scriptAsset?.url ? String(scriptAsset.url) : '';
+        const scriptFile = scriptAsset?.file ? String(scriptAsset.file).replace(/\\/g, '/') : '';
+        const result: string[] = [];
+
+        for (const component of components) {
+            const candidates = [
+                component?.name,
+                component?.cid,
+                component?.path,
+                component?.assetUuid,
+            ].map(readDumpValue).filter(Boolean).map(String);
+
+            const matched = candidates.some((candidate) => matchesComponentName(candidate, className))
+                || Boolean(scriptUuid && candidates.includes(scriptUuid))
+                || Boolean(scriptUrl && candidates.includes(scriptUrl))
+                || Boolean(scriptFile && candidates.some((candidate) => candidate.replace(/\\/g, '/') === scriptFile));
+
+            if (matched) {
+                result.push(...candidates);
+            }
+        }
+
+        return [...new Set(result.filter((candidate) => isComponentAttachCandidate(candidate)))];
+    } catch (error) {
+        console.warn(`[${PACKAGE_NAME}] Failed to query registered components.`, error);
+        return [];
+    }
+}
+
+function isComponentAttachCandidate(candidate: string): boolean {
+    return /^[A-Za-z0-9_$./:@-]+$/.test(candidate);
+}
+
+function readScriptCidFromProgramCache(scriptAsset: any | null, className: string): string[] {
+    if (!scriptAsset?.file) {
+        return [];
+    }
+
+    const sourceUrl = `file:///${String(scriptAsset.file).replace(/\\/g, '/')}`;
+    const result: string[] = [];
+    const targets = [
+        join(Editor.Project.path, 'temp', 'programming', 'packer-driver', 'targets', 'editor'),
+        join(Editor.Project.path, 'temp', 'programming', 'packer-driver', 'targets', 'preview'),
+    ];
+
+    for (const targetDir of targets) {
+        try {
+            const importMapPath = join(targetDir, 'import-map.json');
+            if (!existsSync(importMapPath)) {
+                continue;
+            }
+
+            const importMap = JSON.parse(readFileSync(importMapPath, 'utf8'));
+            const chunkRelative = importMap?.imports?.[sourceUrl] || importMap?.[sourceUrl];
+            if (!chunkRelative) {
+                continue;
+            }
+
+            const chunkFile = join(targetDir, String(chunkRelative).replace(/^\.\//, ''));
+            if (!existsSync(chunkFile)) {
+                continue;
+            }
+
+            const chunkSource = readFileSync(chunkFile, 'utf8');
+            const escapedClassName = className.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const match = chunkSource.match(new RegExp(`_RF\\.push\\(\\{\\},\\s*["']([^"']+)["'],\\s*["']${escapedClassName}["']`));
+            if (match?.[1]) {
+                result.push(match[1]);
+            }
+        } catch (error) {
+            console.warn(`[${PACKAGE_NAME}] Failed to read script cid from program cache.`, error);
+        }
+    }
+
+    return [...new Set(result)];
+}
+
+async function createComponentAndVerify(nodeUuid: string, componentName: string, matchNames: string[]): Promise<boolean> {
     try {
         await Editor.Message.request('scene', 'create-component', {
             uuid: nodeUuid,
-            component: className,
+            component: componentName,
         });
-        return true;
-    } catch (secondError) {
-        console.warn(`[${PACKAGE_NAME}] Automatic component attach failed.`, secondError);
+        await delay(100);
+        if (await findComponentUuid(nodeUuid, matchNames)) {
+            return true;
+        }
+        console.warn(`[${PACKAGE_NAME}] create-component returned but ${componentName} was not found on the node.`);
+        return false;
+    } catch (error) {
+        console.warn(`[${PACKAGE_NAME}] Failed to attach component ${componentName}.`, error);
         return false;
     }
 }
 
-async function bindComponentProperties(nodeUuid: string, className: string, bindings: ScannedBinding[]): Promise<number> {
-    const componentUuid = await findComponentUuid(nodeUuid, className);
+function normalizeClassName(className: string): string {
+    return className.replace(/[^A-Za-z0-9_$\p{ID_Start}\p{ID_Continue}\u200C\u200D]/gu, '_');
+}
+
+async function bindComponentProperties(nodeUuid: string, className: string, scriptUrl: string, bindings: ScannedBinding[]): Promise<number> {
+    const scriptAsset = await queryAssetInfoSafe(scriptUrl);
+    const componentUuid = await findComponentUuid(nodeUuid, getSerializedScriptTypeNames(scriptAsset, className));
     if (!componentUuid) {
         console.warn(`[${PACKAGE_NAME}] Cannot find component ${className} for property binding.`);
         return 0;
@@ -745,9 +995,10 @@ async function bindComponentProperties(nodeUuid: string, className: string, bind
     return boundCount;
 }
 
-async function findComponentUuid(nodeUuid: string, componentName: string): Promise<string | null> {
+async function findComponentUuid(nodeUuid: string, componentName: string | string[]): Promise<string | null> {
     const node = await Editor.Message.request('scene', 'query-node', nodeUuid);
     const components = Array.isArray(node?.__comps__) ? node.__comps__ : [];
+    const componentNames = Array.isArray(componentName) ? componentName : [componentName];
 
     for (const component of components) {
         const componentAny = component as any;
@@ -762,7 +1013,7 @@ async function findComponentUuid(nodeUuid: string, componentName: string): Promi
             componentAny?.value?.type,
         ].map(readDumpValue).filter(Boolean).map(String);
 
-        if (candidates.some((candidate) => matchesComponentName(candidate, componentName))) {
+        if (candidates.some((candidate) => componentNames.some((name) => matchesComponentName(candidate, name)))) {
             return uuid || null;
         }
     }
@@ -831,7 +1082,7 @@ function makeReferenceDumpCandidates(propertyDump: any, targetUuid: string): any
     return candidates;
 }
 
-async function bindSerializedAssetReferences(openedAssetUrl: string | null, className: string, rootName: string, bindings: ScannedBinding[]): Promise<number> {
+async function bindSerializedAssetReferences(openedAssetUrl: string | null, scriptUrl: string, selectedUuid: string, className: string, rootName: string, bindings: ScannedBinding[]): Promise<number> {
     if (!openedAssetUrl) {
         return 0;
     }
@@ -841,8 +1092,7 @@ async function bindSerializedAssetReferences(openedAssetUrl: string | null, clas
         return 0;
     }
 
-    const raw = readFileSync(asset.file, 'utf8');
-    const data = JSON.parse(raw);
+    const data = await readJsonFileWithRetry(asset.file);
     if (!Array.isArray(data)) {
         return 0;
     }
@@ -884,25 +1134,31 @@ async function bindSerializedAssetReferences(openedAssetUrl: string | null, clas
         }
     });
 
-    const targetComponent = data.find((item) => {
+    const selectedNodeId = nodeIdByUuid.get(selectedUuid) ?? nodeIdByName.get(rootName);
+    if (selectedNodeId === undefined) {
+        return 0;
+    }
+
+    const scriptAsset = await queryAssetInfoSafe(scriptUrl);
+    const scriptTypeNames = getSerializedScriptTypeNames(scriptAsset, className);
+    let targetComponent = data.find((item) => {
         if (typeof item?.__type__ !== 'string') {
             return false;
         }
 
         const nodeId = item?.node?.__id__;
         const node = Number.isInteger(nodeId) ? data[nodeId] : null;
-        const attachedToRoot = node?._name === rootName;
+        const attachedToSelectedNode = nodeId === selectedNodeId || node?._name === rootName;
         const hasGeneratedProperty = bindings.some((binding) => Object.prototype.hasOwnProperty.call(item, binding.propertyName));
-        const looksLikeScriptComponent = !item.__type__.startsWith('cc.') && !item.__type__.startsWith('sp.');
 
-        return item.__type__ === className
+        return scriptTypeNames.includes(item.__type__)
+            || item.__type__ === className
             || shortTypeName(item.__type__) === className
-            || hasGeneratedProperty
-            || (attachedToRoot && looksLikeScriptComponent);
+            || (attachedToSelectedNode && hasGeneratedProperty);
     });
 
     if (!targetComponent) {
-        return 0;
+        targetComponent = appendSerializedScriptComponent(data, selectedNodeId, scriptTypeNames[0] || className, bindings);
     }
 
     let boundCount = 0;
@@ -931,6 +1187,59 @@ async function bindSerializedAssetReferences(openedAssetUrl: string | null, clas
 
     writeFileSync(asset.file, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
     return boundCount;
+}
+
+function getSerializedScriptTypeNames(scriptAsset: any | null, className: string): string[] {
+    return [...new Set([
+        ...readScriptCidFromProgramCache(scriptAsset, className),
+        className,
+    ].filter(Boolean))];
+}
+
+function appendSerializedScriptComponent(data: any[], nodeId: number, scriptType: string, bindings: ScannedBinding[]): any {
+    const node = data[nodeId];
+    const componentId = data.length;
+    const prefabInfoId = componentId + 1;
+    const component: any = {
+        __type__: scriptType,
+        _name: '',
+        _objFlags: 0,
+        __editorExtras__: {},
+        node: {
+            __id__: nodeId,
+        },
+        _enabled: true,
+        __prefab: {
+            __id__: prefabInfoId,
+        },
+        _id: '',
+    };
+
+    for (const binding of bindings) {
+        component[binding.propertyName] = null;
+    }
+
+    const prefabInfo = {
+        __type__: 'cc.CompPrefabInfo',
+        fileId: makePrefabFileId(),
+    };
+
+    if (!Array.isArray(node._components)) {
+        node._components = [];
+    }
+    node._components.push({ __id__: componentId });
+    data.push(component, prefabInfo);
+    return component;
+}
+
+function makePrefabFileId(): string {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    const bytes = randomBytes(22);
+    let result = '';
+    for (const byte of bytes) {
+        result += chars[byte % chars.length];
+    }
+    return result;
 }
 
 function shortTypeName(type: string): string {
