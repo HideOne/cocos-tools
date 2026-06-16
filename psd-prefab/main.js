@@ -86,26 +86,33 @@ async function convertPsd(assetInfo) {
         throw new Error("No visible layers found in PSD.");
     }
 
-    for (const layer of layers) {
-        const imageUrl = `${imageFolderUrl}/${layer.safeName}.png`;
-        await Editor.Message.request("asset-db", "create-asset", imageUrl, layer.png, { overwrite: true });
-        layer.imageUrl = imageUrl;
+    const images = assignDedupedImages(layers, imageFolderUrl);
+    for (const image of images) {
+        await Editor.Message.request("asset-db", "create-asset", image.imageUrl, image.png, { overwrite: true });
     }
+
+    await removeDedupedLayerImages(layers, imageFolderUrl);
 
     await Editor.Message.request("asset-db", "refresh-asset", imageFolderUrl);
     await wait(600);
 
-    for (const layer of layers) {
-        layer.spriteFrameUuid = await querySpriteFrameUuid(layer.imageUrl);
+    for (const image of images) {
+        image.spriteFrameUuid = await querySpriteFrameUuid(image.imageUrl);
+        for (const layer of image.layers) {
+            layer.spriteFrameUuid = image.spriteFrameUuid;
+        }
     }
 
+    const imageCount = images.length;
     const prefabJson = buildPrefab(psdName, documentSize, layers);
     await Editor.Message.request("asset-db", "create-asset", prefabUrl, `${JSON.stringify(prefabJson, null, 2)}\n`, { overwrite: true });
+    await removeLegacyMd5MapFile(imageFolderUrl);
+    clearDedupState(layers, images);
     await Editor.Message.request("asset-db", "refresh-asset", psdDirUrl);
 
     return {
         prefabUrl,
-        imageCount: layers.length,
+        imageCount,
     };
 }
 
@@ -336,6 +343,88 @@ async function querySpriteFrameUuid(imageUrl) {
     throw new Error(`Cannot query SpriteFrame for ${imageUrl}`);
 }
 
+function assignDedupedImages(layers, imageFolderUrl) {
+    const imagesByMd5 = new Map();
+    const usedNames = new Set();
+
+    for (const layer of layers) {
+        const md5 = md5Buffer(layer.png);
+        let image = imagesByMd5.get(md5);
+
+        if (!image) {
+            const safeName = makeUniqueName(layer.safeName, usedNames);
+            image = {
+                md5,
+                safeName,
+                imageUrl: `${imageFolderUrl}/${safeName}.png`,
+                png: layer.png,
+                layers: [],
+            };
+            imagesByMd5.set(md5, image);
+        }
+
+        layer.imageMd5 = md5;
+        layer.imageUrl = image.imageUrl;
+        image.layers.push(layer);
+    }
+
+    return Array.from(imagesByMd5.values());
+}
+
+function md5Buffer(buffer) {
+    return crypto.createHash("md5").update(buffer).digest("hex");
+}
+
+async function removeDedupedLayerImages(layers, imageFolderUrl) {
+    const keptUrls = new Set(layers.map((layer) => layer.imageUrl));
+    const staleUrls = new Set();
+
+    for (const layer of layers) {
+        const originalUrl = `${imageFolderUrl}/${layer.safeName}.png`;
+        if (originalUrl !== layer.imageUrl && !keptUrls.has(originalUrl)) {
+            staleUrls.add(originalUrl);
+        }
+    }
+
+    for (const url of staleUrls) {
+        if (!fs.existsSync(dbUrlToFile(url))) {
+            continue;
+        }
+
+        try {
+            await Editor.Message.request("asset-db", "delete-asset", url);
+        } catch (error) {
+            console.warn(`[${PACKAGE_NAME}] Failed to remove stale deduped image: ${url}`, error);
+        }
+    }
+}
+
+async function removeLegacyMd5MapFile(imageFolderUrl) {
+    const url = `${imageFolderUrl}/md5-map.json`;
+    if (!fs.existsSync(dbUrlToFile(url))) {
+        return;
+    }
+
+    try {
+        await Editor.Message.request("asset-db", "delete-asset", url);
+    } catch (error) {
+        console.warn(`[${PACKAGE_NAME}] Failed to remove legacy md5 map: ${url}`, error);
+    }
+}
+
+function clearDedupState(layers, images) {
+    for (const layer of layers) {
+        delete layer.png;
+        delete layer.imageMd5;
+    }
+
+    for (const image of images) {
+        delete image.png;
+        delete image.md5;
+        image.layers = [];
+    }
+}
+
 function buildPrefab(prefabName, documentSize, layers) {
     const renderLayers = [...layers].reverse();
     const data = [{
@@ -500,12 +589,18 @@ function sanitizeFileName(value) {
 function makeUniqueSafeName(name, layers) {
     const base = sanitizeFileName(name);
     const used = new Set(layers.map((layer) => layer.safeName));
+    return makeUniqueName(base, used);
+}
+
+function makeUniqueName(baseName, used) {
+    const base = sanitizeFileName(baseName);
     let next = base;
     let index = 2;
     while (used.has(next)) {
         next = `${base}_${index}`;
         index += 1;
     }
+    used.add(next);
     return next;
 }
 
