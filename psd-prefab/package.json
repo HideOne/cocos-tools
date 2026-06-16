@@ -8,7 +8,9 @@
     "description": "i18n:psd-prefab.description",
     "main": "./main.js",
     "dependencies": {
-        "psd.js": "^3.4.0"
+        "psd.js": "^3.4.0",
+        "pngjs": "^3.4.0",
+        "tesseract.js": "^5.1.1"
     },
     "contributions": {
         "menu": [

@@ -3,6 +3,7 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { PNG } = require("pngjs");
 
 const PACKAGE_NAME = "psd-prefab";
 const WHITE_SPRITE_FRAME_UUID = "7d8f9b89-4fd1-4c9f-a3ab-38ec7cded7ca@f9941";
@@ -231,6 +232,7 @@ async function extractLayers(psd, rootName) {
             ...info,
             safeName: makeUniqueSafeName(info.name, layers),
             png,
+            labelInfo: await createLabelInfo(info, png),
             order: index,
         });
         index += 1;
@@ -254,6 +256,7 @@ async function extractLayers(psd, rootName) {
         width: size.width,
         height: size.height,
         png,
+        labelInfo: null,
         order: 0,
     }];
 }
@@ -413,6 +416,10 @@ function assignDedupedImages(layers, imageFolderUrl) {
     const usedNames = new Set();
 
     for (const layer of layers) {
+        if (layer.labelInfo) {
+            continue;
+        }
+
         const md5 = md5Buffer(layer.png);
         let image = imagesByMd5.get(md5);
 
@@ -438,6 +445,207 @@ function assignDedupedImages(layers, imageFolderUrl) {
 
 function md5Buffer(buffer) {
     return crypto.createHash("md5").update(buffer).digest("hex");
+}
+
+async function createLabelInfo(layerInfo, pngBuffer) {
+    if (!isTextLayerName(layerInfo.name)) {
+        return null;
+    }
+
+    const imageInfo = analyzeTextPng(pngBuffer, layerInfo);
+    const text = await recognizeText(pngBuffer) || placeholderTextFromLayerName(layerInfo.name);
+    return {
+        text,
+        color: imageInfo.color,
+        fontSize: imageInfo.fontSize,
+        lineHeight: Math.max(imageInfo.fontSize, Math.round(layerInfo.height)),
+    };
+}
+
+function isTextLayerName(name) {
+    return /^text_/i.test(String(name || ""));
+}
+
+function analyzeTextPng(buffer, layerInfo) {
+    try {
+        const png = PNG.sync.read(buffer);
+        const bounds = findOpaqueBounds(png);
+        const color = getDominantColor(png, bounds);
+        const textHeight = bounds ? bounds.maxY - bounds.minY + 1 : layerInfo.height;
+        return {
+            color,
+            fontSize: Math.max(1, Math.round(Math.min(layerInfo.height * 1.35, textHeight * 1.45))),
+        };
+    } catch (error) {
+        return {
+            color: { r: 255, g: 255, b: 255, a: 255 },
+            fontSize: Math.max(1, Math.round(layerInfo.height)),
+        };
+    }
+}
+
+function findOpaqueBounds(png) {
+    let minX = png.width;
+    let minY = png.height;
+    let maxX = -1;
+    let maxY = -1;
+
+    for (let y = 0; y < png.height; y += 1) {
+        for (let x = 0; x < png.width; x += 1) {
+            const offset = (png.width * y + x) << 2;
+            const alpha = png.data[offset + 3];
+            if (alpha < 24) {
+                continue;
+            }
+
+            minX = Math.min(minX, x);
+            minY = Math.min(minY, y);
+            maxX = Math.max(maxX, x);
+            maxY = Math.max(maxY, y);
+        }
+    }
+
+    if (maxX < minX || maxY < minY) {
+        return null;
+    }
+
+    return { minX, minY, maxX, maxY };
+}
+
+function getDominantColor(png, bounds) {
+    if (!bounds) {
+        return { r: 255, g: 255, b: 255, a: 255 };
+    }
+
+    const buckets = new Map();
+    for (let y = bounds.minY; y <= bounds.maxY; y += 1) {
+        for (let x = bounds.minX; x <= bounds.maxX; x += 1) {
+            const offset = (png.width * y + x) << 2;
+            const alpha = png.data[offset + 3];
+            if (alpha < 128) {
+                continue;
+            }
+
+            const r = png.data[offset];
+            const g = png.data[offset + 1];
+            const b = png.data[offset + 2];
+            const key = `${r >> 4},${g >> 4},${b >> 4}`;
+            const bucket = buckets.get(key) || { count: 0, r: 0, g: 0, b: 0, a: 0 };
+            bucket.count += 1;
+            bucket.r += r;
+            bucket.g += g;
+            bucket.b += b;
+            bucket.a += alpha;
+            buckets.set(key, bucket);
+        }
+    }
+
+    let best = null;
+    for (const bucket of buckets.values()) {
+        if (!best || bucket.count > best.count) {
+            best = bucket;
+        }
+    }
+
+    if (!best) {
+        return { r: 255, g: 255, b: 255, a: 255 };
+    }
+
+    return {
+        r: Math.round(best.r / best.count),
+        g: Math.round(best.g / best.count),
+        b: Math.round(best.b / best.count),
+        a: 255,
+    };
+}
+
+async function recognizeText(buffer) {
+    try {
+        const tesseract = require("tesseract.js");
+        if (!tesseract || typeof tesseract.recognize !== "function") {
+            return "";
+        }
+
+        const preprocessed = preprocessOcrImage(buffer);
+        const first = preprocessed ? await recognizeTextBuffer(tesseract, preprocessed) : "";
+        if (first) {
+            return first;
+        }
+
+        return await recognizeTextBuffer(tesseract, buffer);
+    } catch (error) {
+        return "";
+    }
+}
+
+async function recognizeTextBuffer(tesseract, buffer) {
+    const result = await withQuietConsoleAsync(() => tesseract.recognize(buffer, "eng", {
+        logger: () => {},
+    }));
+    return normalizeOcrText(String(result && result.data && result.data.text || ""));
+}
+
+function preprocessOcrImage(buffer) {
+    try {
+        const source = PNG.sync.read(buffer);
+        const bounds = findOpaqueBounds(source);
+        if (!bounds) {
+            return null;
+        }
+
+        const scale = 4;
+        const padding = 8;
+        const sourceWidth = bounds.maxX - bounds.minX + 1;
+        const sourceHeight = bounds.maxY - bounds.minY + 1;
+        const output = new PNG({
+            width: sourceWidth * scale + padding * 2,
+            height: sourceHeight * scale + padding * 2,
+        });
+
+        output.data.fill(255);
+        for (let y = 0; y < sourceHeight; y += 1) {
+            for (let x = 0; x < sourceWidth; x += 1) {
+                const sourceOffset = (source.width * (bounds.minY + y) + bounds.minX + x) << 2;
+                const alpha = source.data[sourceOffset + 3];
+                const isTextPixel = alpha >= 48;
+
+                for (let sy = 0; sy < scale; sy += 1) {
+                    for (let sx = 0; sx < scale; sx += 1) {
+                        const outputX = padding + x * scale + sx;
+                        const outputY = padding + y * scale + sy;
+                        const outputOffset = (output.width * outputY + outputX) << 2;
+                        const value = isTextPixel ? 0 : 255;
+                        output.data[outputOffset] = value;
+                        output.data[outputOffset + 1] = value;
+                        output.data[outputOffset + 2] = value;
+                        output.data[outputOffset + 3] = 255;
+                    }
+                }
+            }
+        }
+
+        return PNG.sync.write(output);
+    } catch (error) {
+        return null;
+    }
+}
+
+function normalizeOcrText(text) {
+    return text
+        .replace(/\r/g, "\n")
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .join("\n")
+        .trim();
+}
+
+function placeholderTextFromLayerName(name) {
+    const text = String(name || "")
+        .replace(/^text_+/i, "")
+        .replace(/[_-]+/g, " ")
+        .trim();
+    return text || "TEXT";
 }
 
 async function removeDedupedLayerImages(layers, imageFolderUrl) {
@@ -532,6 +740,13 @@ function buildPrefab(prefabName, documentSize, layers) {
             data.push(createCompPrefabInfo());
         }
 
+        if (options.labelInfo) {
+            const labelId = data.length;
+            node._components.push({ "__id__": labelId });
+            data.push(createLabel(nodeId, options.labelInfo, labelId + 1));
+            data.push(createCompPrefabInfo());
+        }
+
         if (options.widget) {
             const widgetId = data.length;
             node._components.push({ "__id__": widgetId });
@@ -567,7 +782,8 @@ function buildPrefab(prefabName, documentSize, layers) {
                 y: position.y - parentPosition.y,
             },
             uiTransform: { width: layer.width, height: layer.height },
-            spriteFrameUuid: layer.spriteFrameUuid,
+            spriteFrameUuid: layer.labelInfo ? "" : layer.spriteFrameUuid,
+            labelInfo: layer.labelInfo,
         });
 
         for (const child of item.children) {
@@ -693,6 +909,53 @@ function createSprite(nodeId, spriteFrameUuid, prefabInfoId) {
         "_isTrimmedMode": true,
         "_useGrayscale": false,
         "_atlas": null,
+        "_id": "",
+    };
+}
+
+function createLabel(nodeId, labelInfo, prefabInfoId) {
+    return {
+        "__type__": "cc.Label",
+        "_name": "",
+        "_objFlags": 0,
+        "__editorExtras__": {},
+        "node": { "__id__": nodeId },
+        "_enabled": true,
+        "__prefab": { "__id__": prefabInfoId },
+        "_customMaterial": null,
+        "_srcBlendFactor": 2,
+        "_dstBlendFactor": 4,
+        "_color": {
+            "__type__": "cc.Color",
+            "r": labelInfo.color.r,
+            "g": labelInfo.color.g,
+            "b": labelInfo.color.b,
+            "a": labelInfo.color.a,
+        },
+        "_string": labelInfo.text,
+        "_horizontalAlign": 1,
+        "_verticalAlign": 1,
+        "_actualFontSize": 0,
+        "_fontSize": labelInfo.fontSize,
+        "_fontFamily": "Arial",
+        "_lineHeight": labelInfo.lineHeight,
+        "_overflow": 0,
+        "_enableWrapText": false,
+        "_font": null,
+        "_isSystemFontUsed": true,
+        "_spacingX": 0,
+        "_isItalic": false,
+        "_isBold": false,
+        "_isUnderline": false,
+        "_underlineHeight": 2,
+        "_cacheMode": 0,
+        "_enableOutline": false,
+        "_outlineColor": { "__type__": "cc.Color", "r": 0, "g": 0, "b": 0, "a": 255 },
+        "_outlineWidth": 2,
+        "_enableShadow": false,
+        "_shadowColor": { "__type__": "cc.Color", "r": 0, "g": 0, "b": 0, "a": 255 },
+        "_shadowOffset": { "__type__": "cc.Vec2", "x": 2, "y": 2 },
+        "_shadowBlur": 2,
         "_id": "",
     };
 }
