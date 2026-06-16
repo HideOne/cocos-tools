@@ -730,7 +730,10 @@ function getClickHandlerName(propertyName: string): string {
 function updateMarkedSource(existing: string, generated: string): string {
     const bindBlock = pickBlock(generated, AUTO_BIND_START, AUTO_BIND_END);
     const eventBlock = pickBlock(generated, AUTO_BUTTON_EVENT_START, AUTO_BUTTON_EVENT_END);
-    const handlerBlock = pickBlock(generated, AUTO_BUTTON_HANDLER_START, AUTO_BUTTON_HANDLER_END);
+    const handlerBlock = mergeButtonHandlerBlock(
+        pickBlock(existing, AUTO_BUTTON_HANDLER_START, AUTO_BUTTON_HANDLER_END),
+        pickBlock(generated, AUTO_BUTTON_HANDLER_START, AUTO_BUTTON_HANDLER_END),
+    );
 
     if (!hasAllAutoBlocks(existing)) {
         return existing;
@@ -784,6 +787,92 @@ function replaceBlock(source: string, start: string, end: string, content: strin
     return `${source.slice(0, startIndex + start.length)}${content}${source.slice(endIndex)}`;
 }
 
+function mergeButtonHandlerBlock(existingBlock: string, generatedBlock: string): string {
+    const existingHandlers = new Map(parseButtonHandlers(existingBlock).map((handler) => [handler.name, handler.source]));
+    const generatedHandlers = parseButtonHandlers(generatedBlock);
+
+    if (generatedHandlers.length === 0) {
+        return generatedBlock;
+    }
+
+    const mergedHandlers = generatedHandlers
+        .map((handler) => normalizeButtonHandlerSource(existingHandlers.get(handler.name) || handler.source))
+        .join('\n\n');
+
+    return `\n${mergedHandlers}\n    `;
+}
+
+function normalizeButtonHandlerSource(source: string): string {
+    const lines = source.trim().split(/\r?\n/);
+    return lines.map((line, index) => {
+        if (index === 0) {
+            return `    ${line.trimStart()}`;
+        }
+        return line.trimEnd();
+    }).join('\n');
+}
+
+function parseButtonHandlers(block: string): Array<{ name: string; source: string }> {
+    const result: Array<{ name: string; source: string }> = [];
+    const methodPattern = /(?:private|protected|public)?\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\([^)]*\)\s*:\s*void\s*\{/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = methodPattern.exec(block))) {
+        const name = match[1];
+        const methodStart = match.index;
+        const bodyOpenIndex = methodPattern.lastIndex - 1;
+        const methodEnd = findMatchingBrace(block, bodyOpenIndex);
+        if (methodEnd === -1) {
+            continue;
+        }
+
+        result.push({
+            name,
+            source: block.slice(methodStart, methodEnd + 1).trimEnd(),
+        });
+        methodPattern.lastIndex = methodEnd + 1;
+    }
+
+    return result;
+}
+
+function findMatchingBrace(source: string, openIndex: number): number {
+    let depth = 0;
+    let quote: '"' | "'" | '`' | null = null;
+    let escaped = false;
+
+    for (let index = openIndex; index < source.length; index += 1) {
+        const char = source[index];
+
+        if (quote) {
+            if (escaped) {
+                escaped = false;
+            } else if (char === '\\') {
+                escaped = true;
+            } else if (char === quote) {
+                quote = null;
+            }
+            continue;
+        }
+
+        if (char === '"' || char === "'" || char === '`') {
+            quote = char;
+            continue;
+        }
+
+        if (char === '{') {
+            depth += 1;
+        } else if (char === '}') {
+            depth -= 1;
+            if (depth === 0) {
+                return index;
+            }
+        }
+    }
+
+    return -1;
+}
+
 function mergeCcImports(existing: string, generated: string): string {
     const importPattern = /^import\s+\{\s*([^}]+?)\s*\}\s+from\s+['"]cc['"];\s*$/m;
     const existingMatch = existing.match(importPattern);
@@ -800,6 +889,7 @@ function mergeCcImports(existing: string, generated: string): string {
     const merged = sortCcImports([
         ...parseCcImportNames(existingMatch[1]),
         ...parseCcImportNames(generatedMatch[1]),
+        ...detectUsedCcSymbols(existing),
     ]);
 
     return existing.replace(importPattern, `import { ${merged.join(', ')} } from 'cc';`);
@@ -810,6 +900,25 @@ function parseCcImportNames(imports: string): string[] {
         .split(',')
         .map((item) => item.trim())
         .filter(Boolean);
+}
+
+function detectUsedCcSymbols(source: string): string[] {
+    const candidates = [
+        'Node',
+        'Button',
+        'Label',
+        'Sprite',
+        'Widget',
+        'UITransform',
+        'ProgressBar',
+        'ScrollView',
+        'Toggle',
+        'Slider',
+        'EditBox',
+        'RichText',
+    ];
+
+    return candidates.filter((name) => new RegExp(`\\b${name}\\b`).test(source));
 }
 
 async function readAssetText(url: string): Promise<string | null> {
