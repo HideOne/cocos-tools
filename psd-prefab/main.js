@@ -69,7 +69,60 @@ function pickAssetId(value) {
     return value.uuid || value.url || value.source || value.file || "";
 }
 
+function createProgressReporter() {
+    let lastPercent = -10;
+    return (value) => {
+        const percent = Math.max(0, Math.min(100, Math.floor(value / 10) * 10));
+        if (percent === lastPercent) {
+            return;
+        }
+
+        lastPercent = percent;
+        console.log(`[${PACKAGE_NAME}] ${percent}%`);
+    };
+}
+
+function withQuietConsole(callback) {
+    const restore = silenceConsole();
+    try {
+        return callback();
+    } finally {
+        restore();
+    }
+}
+
+async function withQuietConsoleAsync(callback) {
+    const restore = silenceConsole();
+    try {
+        return await callback();
+    } finally {
+        restore();
+    }
+}
+
+function silenceConsole() {
+    const original = {
+        log: console.log,
+        info: console.info,
+        warn: console.warn,
+        debug: console.debug,
+    };
+    const noop = () => {};
+    console.log = noop;
+    console.info = noop;
+    console.warn = noop;
+    console.debug = noop;
+
+    return () => {
+        console.log = original.log;
+        console.info = original.info;
+        console.warn = original.warn;
+        console.debug = original.debug;
+    };
+}
+
 async function convertPsd(assetInfo) {
+    const progress = createProgressReporter();
     const psdPath = assetInfo.file;
     const psdUrl = normalizeDbUrl(assetInfo.url || assetInfo.source);
     const psdDirUrl = dirnameUrl(psdUrl);
@@ -77,25 +130,33 @@ async function convertPsd(assetInfo) {
     const imageFolderUrl = `${psdDirUrl}/${psdName}`;
     const prefabUrl = `${psdDirUrl}/${psdName}.prefab`;
 
+    progress(0);
     ensureAssetFolder(imageFolderUrl);
     await Editor.Message.request("asset-db", "refresh-asset", imageFolderUrl);
+    progress(10);
 
-    const psd = loadPsd(psdPath);
+    const psd = withQuietConsole(() => loadPsd(psdPath));
+    progress(20);
     const documentSize = getDocumentSize(psd);
-    const layers = await extractLayers(psd, psdName);
+    const layers = await withQuietConsoleAsync(() => extractLayers(psd, psdName));
     if (layers.length === 0) {
         throw new Error("No visible layers found in PSD.");
     }
+    progress(30);
 
     const images = assignDedupedImages(layers, imageFolderUrl);
+    progress(40);
     for (const image of images) {
         await Editor.Message.request("asset-db", "create-asset", image.imageUrl, image.png, { overwrite: true });
     }
+    progress(50);
 
     await removeDedupedLayerImages(layers, imageFolderUrl);
 
     await Editor.Message.request("asset-db", "refresh-asset", imageFolderUrl);
     await wait(600);
+    progress(60);
+    progress(70);
 
     for (const image of images) {
         image.spriteFrameUuid = await querySpriteFrameUuid(image.imageUrl);
@@ -103,13 +164,16 @@ async function convertPsd(assetInfo) {
             layer.spriteFrameUuid = image.spriteFrameUuid;
         }
     }
+    progress(80);
 
     const imageCount = images.length;
     const prefabJson = buildPrefab(psdName, documentSize, layers);
+    progress(90);
     await Editor.Message.request("asset-db", "create-asset", prefabUrl, `${JSON.stringify(prefabJson, null, 2)}\n`, { overwrite: true });
     await removeLegacyMd5MapFile(imageFolderUrl);
     clearDedupState(layers, images);
     await Editor.Message.request("asset-db", "refresh-asset", psdDirUrl);
+    progress(100);
 
     return {
         prefabUrl,
@@ -395,7 +459,7 @@ async function removeDedupedLayerImages(layers, imageFolderUrl) {
         try {
             await Editor.Message.request("asset-db", "delete-asset", url);
         } catch (error) {
-            console.warn(`[${PACKAGE_NAME}] Failed to remove stale deduped image: ${url}`, error);
+            // Ignore stale cleanup failures; conversion output is still valid.
         }
     }
 }
@@ -409,7 +473,7 @@ async function removeLegacyMd5MapFile(imageFolderUrl) {
     try {
         await Editor.Message.request("asset-db", "delete-asset", url);
     } catch (error) {
-        console.warn(`[${PACKAGE_NAME}] Failed to remove legacy md5 map: ${url}`, error);
+        // Ignore legacy cleanup failures; conversion output is still valid.
     }
 }
 
