@@ -33,12 +33,22 @@
     "contributions": {
         "menu": [
             {
-                "path": "i18n:bind-tool.menu",
-                "label": "i18n:bind-tool.bind_selected_node",
+                "path": "i18n:menu.extension/i18n:bind-tool.menu",
+                "label": "i18n:bind-tool.generate_and_bind",
                 "message": "bind-selected-node"
             },
             {
-                "path": "i18n:bind-tool.menu",
+                "path": "i18n:menu.extension/i18n:bind-tool.menu",
+                "label": "i18n:bind-tool.generate_script",
+                "message": "generate-selected-node-script"
+            },
+            {
+                "path": "i18n:menu.extension/i18n:bind-tool.menu",
+                "label": "i18n:bind-tool.bind_references",
+                "message": "bind-selected-node-references"
+            },
+            {
+                "path": "i18n:menu.extension/i18n:bind-tool.menu",
                 "label": "i18n:bind-tool.rules_panel",
                 "message": "open-rules-panel"
             }
@@ -70,6 +80,16 @@
             "bind-selected-node": {
                 "methods": [
                     "bindSelectedNode"
+                ]
+            },
+            "generate-selected-node-script": {
+                "methods": [
+                    "generateSelectedNodeScript"
+                ]
+            },
+            "bind-selected-node-references": {
+                "methods": [
+                    "bindSelectedNodeReferences"
                 ]
             }
         }

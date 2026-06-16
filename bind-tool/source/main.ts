@@ -14,6 +14,7 @@ const AUTO_BUTTON_HANDLER_START = '// AUTO_BUTTON_HANDLER_START';
 const AUTO_BUTTON_HANDLER_END = '// AUTO_BUTTON_HANDLER_END';
 
 type BindTarget = 'node' | 'component';
+type BindMode = 'generate-and-bind' | 'generate' | 'bind';
 
 interface BindToolConfig {
     scriptRoot: string;
@@ -155,42 +156,67 @@ export const methods: { [key: string]: (...args: any[]) => any } = {
     },
 
     async bindSelectedNode() {
-        try {
-            const result = await bindSelectedNode();
-            const detail = [
-                `Script: ${result.scriptUrl}`,
-                `Properties: ${result.bindings.length}`,
-                `Button events: ${result.buttons.length}`,
-                result.componentAttached ? 'Component: attach attempted successfully' : 'Component: script generated; run again after import if attach is needed',
-                `Bound references: ${result.propertiesBound}`,
-            ].join('\n');
+        await runBindSelectedNode('generate-and-bind');
+    },
 
-            Editor.Task.addNotice({
-                title: result.created ? 'Bind node complete' : 'Bind node updated',
-                message: detail,
-                type: 'success',
-                source: PACKAGE_NAME,
-                timeout: 6000,
-            });
-        } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            console.error(`[${PACKAGE_NAME}] ${message}`, error);
-            Editor.Task.addNotice({
-                title: 'Bind node failed',
-                message,
-                type: 'error',
-                source: PACKAGE_NAME,
-                timeout: 8000,
-            });
-        }
+    async generateSelectedNodeScript() {
+        await runBindSelectedNode('generate');
+    },
+
+    async bindSelectedNodeReferences() {
+        await runBindSelectedNode('bind');
     },
 };
+
+async function runBindSelectedNode(mode: BindMode): Promise<void> {
+    const modeTitle = getModeTitle(mode);
+    try {
+        const result = await bindSelectedNode(mode);
+        const detail = [
+            `Script: ${result.scriptUrl}`,
+            `Properties: ${result.bindings.length}`,
+            `Button events: ${result.buttons.length}`,
+            mode === 'generate' ? 'Component: skipped' : (result.componentAttached ? 'Component: attach attempted successfully' : 'Component: not attached'),
+            mode === 'generate' ? 'Bound references: skipped' : `Bound references: ${result.propertiesBound}`,
+        ].join('\n');
+
+        Editor.Task.addNotice({
+            title: `${modeTitle} complete`,
+            message: detail,
+            type: 'success',
+            source: PACKAGE_NAME,
+            timeout: 6000,
+        });
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`[${PACKAGE_NAME}] ${message}`, error);
+        Editor.Task.addNotice({
+            title: `${modeTitle} failed`,
+            message,
+            type: 'error',
+            source: PACKAGE_NAME,
+            timeout: 8000,
+        });
+    }
+}
+
+function getModeTitle(mode: BindMode): string {
+    if (mode === 'generate') {
+        return 'Generate script';
+    }
+
+    if (mode === 'bind') {
+        return 'Bind references';
+    }
+
+    return 'Generate and bind';
+}
 
 export function load() {}
 
 export function unload() {}
 
-async function bindSelectedNode(): Promise<BindResult> {
+async function bindSelectedNode(mode: BindMode): Promise<BindResult> {
     const selectedUuid = Editor.Selection.getLastSelected('node') || Editor.Selection.getSelected('node')[0];
     if (!selectedUuid) {
         throw new Error('Please select a node first.');
@@ -211,31 +237,38 @@ async function bindSelectedNode(): Promise<BindResult> {
     const scriptUrl = makeScriptUrl(openedAssetUrl, className, config.scriptRoot);
     const scan = scanBindings(selectedTree, config);
     const buttons = scan.filter((item) => item.generateClickEvent);
-    await ensureButtonComponents(buttons, config);
-    const source = renderScript(className, scan, buttons);
-    const existing = await readAssetText(scriptUrl);
-    const canUpdateExisting = existing ? hasAllAutoBlocks(existing) : true;
-    const finalSource = existing ? updateMarkedSource(existing, source) : source;
-
-    if (existing && !canUpdateExisting) {
-        throw new Error(`Script exists but auto-generated markers are missing. Stop to avoid overwriting user code: ${scriptUrl}`);
-    }
-
-    const created = !existing;
-    await writeAsset(scriptUrl, finalSource, created);
-    await Editor.Message.request('asset-db', 'refresh-asset', scriptUrl);
-
-    const componentAttached = await tryAttachComponent(selectedUuid, className, scriptUrl);
+    let created = false;
+    let componentAttached = false;
     let propertiesBound = 0;
 
-    try {
-        await Editor.Message.request('scene', 'save-scene');
-        propertiesBound = await bindSerializedAssetReferences(openedAssetUrl, scriptUrl, selectedUuid, className, getNodeName(selectedTree), scan);
-        if (openedAssetUrl) {
-            await Editor.Message.request('asset-db', 'refresh-asset', openedAssetUrl);
+    if (mode !== 'bind') {
+        const source = renderScript(className, scan, buttons);
+        const existing = await readAssetText(scriptUrl);
+        const canUpdateExisting = existing ? hasAllAutoBlocks(existing) : true;
+        const finalSource = existing ? updateMarkedSource(existing, source) : source;
+
+        if (existing && !canUpdateExisting) {
+            throw new Error(`Script exists but auto-generated markers are missing. Stop to avoid overwriting user code: ${scriptUrl}`);
         }
-    } catch (error) {
-        console.warn(`[${PACKAGE_NAME}] Failed to save the current scene or prefab. Please save manually.`, error);
+
+        created = !existing;
+        await writeAsset(scriptUrl, finalSource, created);
+        await Editor.Message.request('asset-db', 'refresh-asset', scriptUrl);
+    } else if (!await readAssetText(scriptUrl)) {
+        throw new Error(`Script does not exist. Generate it first: ${scriptUrl}`);
+    }
+
+    if (mode !== 'generate') {
+        await ensureButtonComponents(buttons, config);
+        componentAttached = await tryAttachComponent(selectedUuid, className, scriptUrl);
+
+        try {
+            await Editor.Message.request('scene', 'save-scene');
+            propertiesBound = await bindSerializedAssetReferences(openedAssetUrl, scriptUrl, selectedUuid, className, getNodeName(selectedTree), scan);
+            await Editor.Message.request('asset-db', 'refresh-asset', openedAssetUrl);
+        } catch (error) {
+            console.warn(`[${PACKAGE_NAME}] Failed to save the current scene or prefab. Please save manually.`, error);
+        }
     }
 
     return {

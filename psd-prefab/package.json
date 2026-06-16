@@ -15,7 +15,7 @@
     "contributions": {
         "menu": [
             {
-                "path": "i18n:psd-prefab.menu",
+                "path": "i18n:menu.extension/i18n:psd-prefab.menu",
                 "label": "i18n:psd-prefab.convert_selected",
                 "message": "convert-selected-psd"
             }
