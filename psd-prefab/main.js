@@ -5,6 +5,7 @@ const path = require("path");
 const crypto = require("crypto");
 
 const PACKAGE_NAME = "psd-prefab";
+const WHITE_SPRITE_FRAME_UUID = "7d8f9b89-4fd1-4c9f-a3ab-38ec7cded7ca@f9941";
 
 exports.methods = {
     async convertSelectedPsd() {
@@ -328,16 +329,16 @@ function streamToBuffer(stream) {
 }
 
 async function querySpriteFrameUuid(imageUrl) {
-    const imageInfo = await Editor.Message.request("asset-db", "query-asset-info", imageUrl, ["uuid", "subAssets"]);
-    const subAssets = imageInfo && imageInfo.subAssets ? Object.values(imageInfo.subAssets) : [];
-    const spriteFrame = subAssets.find((asset) => asset && (asset.type === "cc.SpriteFrame" || asset.importer === "sprite-frame"));
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+        const imageInfo = await Editor.Message.request("asset-db", "query-asset-info", imageUrl, ["uuid", "subAssets"]);
+        const subAssets = imageInfo && imageInfo.subAssets ? Object.values(imageInfo.subAssets) : [];
+        const spriteFrame = subAssets.find((asset) => asset && (asset.type === "cc.SpriteFrame" || asset.importer === "sprite-frame"));
 
-    if (spriteFrame && spriteFrame.uuid) {
-        return spriteFrame.uuid;
-    }
+        if (spriteFrame && spriteFrame.uuid) {
+            return spriteFrame.uuid;
+        }
 
-    if (imageInfo && imageInfo.uuid) {
-        return `${imageInfo.uuid}@f9941`;
+        await wait(300);
     }
 
     throw new Error(`Cannot query SpriteFrame for ${imageUrl}`);
@@ -438,33 +439,69 @@ function buildPrefab(prefabName, documentSize, layers) {
         "persistent": false,
     }];
 
-    const rootNode = createNode(prefabName, null);
-    data.push(rootNode);
-    const rootUiId = data.length;
-    rootNode._components.push({ "__id__": rootUiId });
-    data.push(createUiTransform(1, documentSize.width, documentSize.height, rootUiId + 1));
-    data.push(createCompPrefabInfo());
-    rootNode._prefab = { "__id__": data.length };
-    data.push(createPrefabInfo(1));
+    function appendNode(name, parentId, options = {}) {
+        const nodeId = data.length;
+        const node = createNode(name, parentId);
+        data.push(node);
+
+        if (parentId !== null) {
+            data[parentId]._children.push({ "__id__": nodeId });
+        }
+
+        if (options.position) {
+            node._lpos.x = options.position.x;
+            node._lpos.y = options.position.y;
+        }
+
+        if (options.uiTransform) {
+            const uiId = data.length;
+            node._components.push({ "__id__": uiId });
+            data.push(createUiTransform(nodeId, options.uiTransform.width, options.uiTransform.height, uiId + 1));
+            data.push(createCompPrefabInfo());
+        }
+
+        if (options.spriteFrameUuid) {
+            const spriteId = data.length;
+            node._components.push({ "__id__": spriteId });
+            data.push(createSprite(nodeId, options.spriteFrameUuid, spriteId + 1));
+            data.push(createCompPrefabInfo());
+        }
+
+        if (options.widget) {
+            const widgetId = data.length;
+            node._components.push({ "__id__": widgetId });
+            data.push(createWidget(nodeId, widgetId + 1));
+            data.push(createCompPrefabInfo());
+        }
+
+        node._prefab = { "__id__": data.length };
+        data.push(createPrefabInfo(1));
+        return nodeId;
+    }
+
+    appendNode(prefabName, null, {
+        uiTransform: { width: documentSize.width, height: documentSize.height },
+    });
+
+    appendNode("mask", 1, {
+        uiTransform: { width: documentSize.width, height: documentSize.height },
+        spriteFrameUuid: WHITE_SPRITE_FRAME_UUID,
+        widget: true,
+    });
+
+    const contentNodeId = appendNode("content", 1, {
+        uiTransform: { width: documentSize.width, height: documentSize.height },
+    });
 
     for (const layer of renderLayers) {
-        const nodeId = data.length;
-        const uiId = nodeId + 1;
-        const spriteId = nodeId + 3;
-        const prefabInfoId = nodeId + 5;
-        const node = createNode(layer.name, 1);
-        node._components.push({ "__id__": uiId }, { "__id__": spriteId });
-        node._prefab = { "__id__": prefabInfoId };
-        node._lpos.x = layer.left + layer.width / 2 - documentSize.width / 2;
-        node._lpos.y = documentSize.height / 2 - layer.top - layer.height / 2;
-        rootNode._children.push({ "__id__": nodeId });
-
-        data.push(node);
-        data.push(createUiTransform(nodeId, layer.width, layer.height, uiId + 1));
-        data.push(createCompPrefabInfo());
-        data.push(createSprite(nodeId, layer.spriteFrameUuid, spriteId + 1));
-        data.push(createCompPrefabInfo());
-        data.push(createPrefabInfo(1));
+        appendNode(layer.name, contentNodeId, {
+            position: {
+                x: layer.left + layer.width / 2 - documentSize.width / 2,
+                y: documentSize.height / 2 - layer.top - layer.height / 2,
+            },
+            uiTransform: { width: layer.width, height: layer.height },
+            spriteFrameUuid: layer.spriteFrameUuid,
+        });
     }
 
     return data;
@@ -529,6 +566,37 @@ function createSprite(nodeId, spriteFrameUuid, prefabInfoId) {
         "_isTrimmedMode": true,
         "_useGrayscale": false,
         "_atlas": null,
+        "_id": "",
+    };
+}
+
+function createWidget(nodeId, prefabInfoId) {
+    return {
+        "__type__": "cc.Widget",
+        "_name": "",
+        "_objFlags": 0,
+        "__editorExtras__": {},
+        "node": { "__id__": nodeId },
+        "_enabled": true,
+        "__prefab": { "__id__": prefabInfoId },
+        "_alignFlags": 45,
+        "_target": null,
+        "_left": 0,
+        "_right": 0,
+        "_top": 0,
+        "_bottom": 0,
+        "_horizontalCenter": 0,
+        "_verticalCenter": 0,
+        "_isAbsLeft": true,
+        "_isAbsRight": true,
+        "_isAbsTop": true,
+        "_isAbsBottom": true,
+        "_isAbsHorizontalCenter": true,
+        "_isAbsVerticalCenter": true,
+        "_originalWidth": 0,
+        "_originalHeight": 0,
+        "_alignMode": 2,
+        "_lockFlags": 0,
         "_id": "",
     };
 }
