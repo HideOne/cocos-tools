@@ -492,6 +492,7 @@ function clearDedupState(layers, images) {
 
 function buildPrefab(prefabName, documentSize, layers) {
     const renderLayers = [...layers].reverse();
+    const hierarchy = buildLayerHierarchy(renderLayers);
     const data = [{
         "__type__": "cc.Prefab",
         "_name": prefabName,
@@ -557,18 +558,80 @@ function buildPrefab(prefabName, documentSize, layers) {
         uiTransform: { width: documentSize.width, height: documentSize.height },
     });
 
-    for (const layer of renderLayers) {
-        appendNode(layer.name, contentNodeId, {
+    function appendLayerItem(item, parentNodeId, parentPosition) {
+        const layer = item.layer;
+        const position = getLayerContentPosition(layer, documentSize);
+        const nodeId = appendNode(layer.name, parentNodeId, {
             position: {
-                x: layer.left + layer.width / 2 - documentSize.width / 2,
-                y: documentSize.height / 2 - layer.top - layer.height / 2,
+                x: position.x - parentPosition.x,
+                y: position.y - parentPosition.y,
             },
             uiTransform: { width: layer.width, height: layer.height },
             spriteFrameUuid: layer.spriteFrameUuid,
         });
+
+        for (const child of item.children) {
+            appendLayerItem(child, nodeId, position);
+        }
+    }
+
+    for (const item of hierarchy) {
+        appendLayerItem(item, contentNodeId, { x: 0, y: 0 });
     }
 
     return data;
+}
+
+function buildLayerHierarchy(renderLayers) {
+    const items = renderLayers.map((layer, renderIndex) => ({
+        layer,
+        renderIndex,
+        parent: null,
+        children: [],
+    }));
+
+    for (const item of items) {
+        let parent = null;
+        for (const candidate of items) {
+            if (candidate.renderIndex >= item.renderIndex) {
+                continue;
+            }
+
+            if (!containsLayer(candidate.layer, item.layer)) {
+                continue;
+            }
+
+            if (!parent || layerArea(candidate.layer) < layerArea(parent.layer)) {
+                parent = candidate;
+            }
+        }
+
+        item.parent = parent;
+        if (parent) {
+            parent.children.push(item);
+        }
+    }
+
+    return items.filter((item) => !item.parent);
+}
+
+function containsLayer(parent, child) {
+    const epsilon = 0.5;
+    return parent.left <= child.left + epsilon
+        && parent.top <= child.top + epsilon
+        && parent.left + parent.width >= child.left + child.width - epsilon
+        && parent.top + parent.height >= child.top + child.height - epsilon;
+}
+
+function layerArea(layer) {
+    return layer.width * layer.height;
+}
+
+function getLayerContentPosition(layer, documentSize) {
+    return {
+        x: layer.left + layer.width / 2 - documentSize.width / 2,
+        y: documentSize.height / 2 - layer.top - layer.height / 2,
+    };
 }
 
 function createNode(name, parentId) {
