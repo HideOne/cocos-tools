@@ -1,0 +1,30 @@
+{
+  "name": "psd-prefab",
+  "version": "1.0.0",
+  "description": "Convert PSD assets into Cocos Creator 2.4.14 prefabs and PNG layers.",
+  "author": "hideOne",
+  "main": "main.js",
+  "main-menu": {
+    "Packages/PSD Prefab/Convert Selected PSD": {
+      "message": "psd-prefab:convert-selected-psd"
+    }
+  },
+  "asset-menu": {
+    "PSD Prefab/Convert to Prefab": {
+      "message": "psd-prefab:convert-psd-asset"
+    }
+  },
+  "contributions": {
+    "assets": {
+      "menu": {
+        "methods": "./asset-menu.js",
+        "assetMenu": "assetMenu"
+      }
+    }
+  },
+  "dependencies": {
+    "psd.js": "^3.4.0",
+    "pngjs": "^3.4.0",
+    "tesseract.js": "^5.1.1"
+  }
+}

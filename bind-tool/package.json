@@ -1,0 +1,31 @@
+{
+  "name": "bind-tool",
+  "version": "1.0.0",
+  "description": "Generate and bind TypeScript component references for Cocos Creator 2.4.14.",
+  "author": "hideOne",
+  "main": "main.js",
+  "main-menu": {
+    "Packages/Bind Tool/Generate and Bind": {
+      "message": "bind-tool:bind-selected-node"
+    },
+    "Packages/Bind Tool/Generate Script": {
+      "message": "bind-tool:generate-selected-node-script"
+    },
+    "Packages/Bind Tool/Bind References": {
+      "message": "bind-tool:bind-selected-node-references"
+    },
+    "Packages/Bind Tool/Rules": {
+      "message": "bind-tool:open-rules-panel"
+    }
+  },
+  "panel": {
+    "main": "panel/index.js",
+    "type": "dockable",
+    "title": "Bind Tool Rules",
+    "width": 900,
+    "height": 620,
+    "min-width": 720,
+    "min-height": 420,
+    "resizable": true
+  }
+}
