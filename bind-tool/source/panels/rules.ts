@@ -8,6 +8,7 @@ interface SimpleRule {
 
 interface BindToolConfig {
     scriptRoot: string;
+    scriptNamePrefix: string;
     autoAddButtonComponent: boolean;
     overwriteMode: 'marker';
     stopPrefix: string;
@@ -39,8 +40,12 @@ export const template = `
 
     <div class="settings">
         <label>
-            <span>Script Root</span>
-            <input id="scriptRoot" spellcheck="false" />
+            <span>Script Root (relative to bundle, or assets)</span>
+            <input id="scriptRoot" spellcheck="false" placeholder="e.g. . or src" />
+        </label>
+        <label>
+            <span>Script Name Prefix</span>
+            <input id="scriptNamePrefix" spellcheck="false" placeholder="e.g. UI" />
         </label>
         <label>
             <span>Stop Prefix</span>
@@ -113,7 +118,7 @@ p {
 
 .settings {
     display: grid;
-    grid-template-columns: minmax(180px, 1fr) minmax(160px, 220px) minmax(180px, auto);
+    grid-template-columns: repeat(2, minmax(180px, 1fr));
     gap: 10px;
     align-items: end;
 }
@@ -218,6 +223,7 @@ td.operation {
 export const $ = {
     rules: '#rules',
     scriptRoot: '#scriptRoot',
+    scriptNamePrefix: '#scriptNamePrefix',
     stopPrefix: '#stopPrefix',
     autoAddButtonComponent: '#autoAddButtonComponent',
     add: '#add',
@@ -244,7 +250,8 @@ async function loadConfig() {
 
 function makeDefaultConfig(): BindToolConfig {
     return {
-        scriptRoot: 'assets/src',
+        scriptRoot: '.',
+        scriptNamePrefix: '',
         autoAddButtonComponent: true,
         overwriteMode: 'marker',
         stopPrefix: 'stop',
@@ -258,7 +265,8 @@ function normalizeConfig(config: any): BindToolConfig {
         : defaultRules.map((rule) => ({ ...rule }));
 
     return {
-        scriptRoot: String(config?.scriptRoot || 'assets/src'),
+        scriptRoot: String(config?.scriptRoot || '.'),
+        scriptNamePrefix: String(config?.scriptNamePrefix ?? ''),
         autoAddButtonComponent: config?.autoAddButtonComponent !== false,
         overwriteMode: 'marker',
         stopPrefix: String(config?.stopPrefix || 'stop'),
@@ -276,6 +284,7 @@ function normalizeRule(rule: any): SimpleRule {
 
 function renderConfig() {
     input('scriptRoot').value = currentConfig.scriptRoot;
+    input('scriptNamePrefix').value = currentConfig.scriptNamePrefix;
     input('stopPrefix').value = currentConfig.stopPrefix;
     input('autoAddButtonComponent').checked = currentConfig.autoAddButtonComponent;
     element('rules').innerHTML = currentConfig.rules.map(renderRule).join('');
@@ -344,7 +353,8 @@ function onRulesChanged(event: Event) {
 
 function collectConfig(): BindToolConfig {
     return {
-        scriptRoot: input('scriptRoot').value.trim() || 'assets/src',
+        scriptRoot: input('scriptRoot').value.trim() || '.',
+        scriptNamePrefix: input('scriptNamePrefix').value.trim(),
         stopPrefix: input('stopPrefix').value.trim() || 'stop',
         autoAddButtonComponent: input('autoAddButtonComponent').checked,
         overwriteMode: 'marker',

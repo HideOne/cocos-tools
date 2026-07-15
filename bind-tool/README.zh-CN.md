@@ -18,7 +18,7 @@ Cocos Creator 3.8.x 编辑器扩展，用于根据当前选中节点自动生成
 - `stop` 开头：当前节点和子节点全部跳过。
 - `node_stop` 开头：当前节点生成 `Node` 属性，但不继续扫描子节点。
 
-脚本默认生成到 `assets/src`，并尽量按当前打开的 prefab 或 scene 资源路径镜像目录。
+脚本输出目录由 `scriptRoot` 决定：若当前 prefab/scene 位于 Asset Bundle 内，则相对于该 bundle 根目录；否则相对于项目的 `assets` 目录。默认 `.` 表示写在对应根目录下。
 
 ## 自动生成标记
 
@@ -43,7 +43,8 @@ Cocos Creator 3.8.x 编辑器扩展，用于根据当前选中节点自动生成
 
 ```json
 {
-  "scriptRoot": "assets/src",
+  "scriptRoot": ".",
+  "scriptNamePrefix": "",
   "autoAddButtonComponent": true,
   "overwriteMode": "marker",
   "stopPrefix": "stop",
@@ -55,6 +56,14 @@ Cocos Creator 3.8.x 编辑器扩展，用于根据当前选中节点自动生成
   ]
 }
 ```
+
+`scriptRoot` 相对路径基准：
+- prefab/scene 在 Asset Bundle 内：相对该 bundle 根目录（文件夹 meta 中 `userData.isBundle = true`）
+- 否则：相对项目 `assets` 目录
+
+例如 bundle 为 `assets/test`、`scriptRoot` 为 `src` 时，脚本生成到 `assets/test/src/`；不在 bundle 内时则生成到 `assets/src/`。
+
+`scriptNamePrefix` 会加在生成的脚本类名/文件名前。例如节点名为 `LoginPanel`、前缀为 `UI` 时，生成 `UILoginPanel.ts`。节点名已带此前缀时不会重复添加。
 
 ## 说明
 

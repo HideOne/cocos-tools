@@ -18,6 +18,8 @@ Open `Bind Tool/Rules` to edit the prefix rules in a dockable panel.
 - `stop`: skips the node and its children.
 - `node_stop`: binds the node but does not scan its children.
 
-Scripts are generated under `assets/src` by default and mirror the current prefab or scene asset path when the editor exposes it.
+`scriptRoot` is resolved relative to the owning Asset Bundle root when the opened prefab/scene is inside a bundle (`userData.isBundle = true`). Otherwise it is resolved relative to the project `assets` directory. Default `.` writes into that root.
+
+Configure `scriptNamePrefix` in `Bind Tool/Rules` to prepend a prefix to generated script class/file names (e.g. `UI` + `LoginPanel` → `UILoginPanel.ts`). Existing prefixes are not duplicated.
 
 Existing scripts are updated only inside the auto-generated marker blocks.

@@ -18,6 +18,7 @@ type BindMode = 'generate-and-bind' | 'generate' | 'bind';
 
 interface BindToolConfig {
     scriptRoot: string;
+    scriptNamePrefix: string;
     autoAddButtonComponent: boolean;
     overwriteMode: 'marker';
     stopPrefix: string;
@@ -51,6 +52,8 @@ interface ScannedBinding {
 interface BindResult {
     className: string;
     scriptUrl: string;
+    openedAssetUrl: string;
+    scriptBaseDir: string;
     bindings: ScannedBinding[];
     buttons: ScannedBinding[];
     created: boolean;
@@ -59,7 +62,8 @@ interface BindResult {
 }
 
 const defaultConfig: BindToolConfig = {
-    scriptRoot: 'assets/src',
+    scriptRoot: '.',
+    scriptNamePrefix: '',
     autoAddButtonComponent: true,
     overwriteMode: 'marker',
     stopPrefix: 'stop',
@@ -139,6 +143,7 @@ export const methods: { [key: string]: (...args: any[]) => any } = {
         };
 
         await Editor.Profile.setProject(PACKAGE_NAME, 'scriptRoot', nextConfig.scriptRoot);
+        await Editor.Profile.setProject(PACKAGE_NAME, 'scriptNamePrefix', nextConfig.scriptNamePrefix);
         await Editor.Profile.setProject(PACKAGE_NAME, 'autoAddButtonComponent', nextConfig.autoAddButtonComponent);
         await Editor.Profile.setProject(PACKAGE_NAME, 'overwriteMode', nextConfig.overwriteMode);
         await Editor.Profile.setProject(PACKAGE_NAME, 'stopPrefix', nextConfig.stopPrefix);
@@ -148,6 +153,7 @@ export const methods: { [key: string]: (...args: any[]) => any } = {
 
     async resetConfig() {
         await Editor.Profile.setProject(PACKAGE_NAME, 'scriptRoot', defaultConfig.scriptRoot);
+        await Editor.Profile.setProject(PACKAGE_NAME, 'scriptNamePrefix', defaultConfig.scriptNamePrefix);
         await Editor.Profile.setProject(PACKAGE_NAME, 'autoAddButtonComponent', defaultConfig.autoAddButtonComponent);
         await Editor.Profile.setProject(PACKAGE_NAME, 'overwriteMode', defaultConfig.overwriteMode);
         await Editor.Profile.setProject(PACKAGE_NAME, 'stopPrefix', defaultConfig.stopPrefix);
@@ -173,6 +179,8 @@ async function runBindSelectedNode(mode: BindMode): Promise<void> {
     try {
         const result = await bindSelectedNode(mode);
         const detail = [
+            `Opened: ${result.openedAssetUrl}`,
+            `Script base: ${result.scriptBaseDir}`,
             `Script: ${result.scriptUrl}`,
             `Properties: ${result.bindings.length}`,
             `Button events: ${result.buttons.length}`,
@@ -228,13 +236,16 @@ async function bindSelectedNode(mode: BindMode): Promise<BindResult> {
     }
 
     const nodeName = getNodeName(selectedTree);
-    const className = toClassName(nodeName);
     const config = await readConfig();
+    const className = applyScriptNamePrefix(toClassName(nodeName), config.scriptNamePrefix);
     const openedAssetUrl = await queryOpenedAssetUrl(selectedTree);
     if (!openedAssetUrl) {
         throw new Error('Cannot locate the opened prefab or scene asset. Please save the prefab/scene and run bind again.');
     }
+    const scriptBaseDir = getScriptBaseDir(openedAssetUrl);
     const scriptUrl = makeScriptUrl(openedAssetUrl, className, config.scriptRoot);
+    console.log(`[${PACKAGE_NAME}] Opened asset: ${openedAssetUrl}`);
+    console.log(`[${PACKAGE_NAME}] Script base: ${scriptBaseDir}, scriptRoot: ${config.scriptRoot}, script: ${scriptUrl}`);
     const scan = scanBindings(selectedTree, config);
     const buttons = scan.filter((item) => item.generateClickEvent);
     let created = false;
@@ -274,6 +285,8 @@ async function bindSelectedNode(mode: BindMode): Promise<BindResult> {
     return {
         className,
         scriptUrl,
+        openedAssetUrl,
+        scriptBaseDir,
         bindings: scan,
         buttons,
         created,
@@ -288,6 +301,7 @@ async function readConfig(): Promise<BindToolConfig> {
         return {
             ...defaultConfig,
             ...(projectConfig || {}),
+            scriptNamePrefix: String(projectConfig?.scriptNamePrefix ?? defaultConfig.scriptNamePrefix),
             rules: normalizeRules(projectConfig?.rules),
         };
     } catch {
@@ -371,17 +385,135 @@ function isButtonType(propertyType: string): boolean {
 }
 
 async function queryOpenedAssetUrl(selectedTree: any): Promise<string | null> {
+    const fromSave = await queryUrlFromSaveScene();
+    if (fromSave) {
+        return fromSave;
+    }
+
+    const fromPrefabDump = await queryUrlFromPrefabDump(selectedTree);
+    if (fromPrefabDump) {
+        return fromPrefabDump;
+    }
+
+    const fromSelectedAsset = await queryUrlFromSelectedAsset();
+    if (fromSelectedAsset) {
+        return fromSelectedAsset;
+    }
+
+    return findAssetUrlByNodeTreeWithRetry(selectedTree);
+}
+
+async function queryUrlFromSaveScene(): Promise<string | null> {
     try {
         const savedId = await Editor.Message.request('scene', 'save-scene');
         if (!savedId) {
-            return findAssetUrlByNodeTreeWithRetry(selectedTree);
+            return null;
         }
 
-        const asset = await Editor.Message.request('asset-db', 'query-asset-info', savedId);
-        return asset?.url || asset?.source || findAssetUrlByNodeTreeWithRetry(selectedTree);
+        return resolveAssetUrl(String(savedId));
     } catch {
-        return findAssetUrlByNodeTreeWithRetry(selectedTree);
+        return null;
     }
+}
+
+async function queryUrlFromPrefabDump(selectedTree: any): Promise<string | null> {
+    try {
+        const rootTree = await Editor.Message.request('scene', 'query-node-tree');
+        const candidates = [rootTree, selectedTree];
+        for (const tree of candidates) {
+            const assetUuid = extractPrefabAssetUuid(tree);
+            if (!assetUuid) {
+                continue;
+            }
+
+            const url = await resolveAssetUrl(assetUuid);
+            if (url) {
+                return url;
+            }
+        }
+    } catch {
+        // ignore and fall through
+    }
+
+    return null;
+}
+
+async function queryUrlFromSelectedAsset(): Promise<string | null> {
+    try {
+        const selectedAsset = Editor.Selection.getLastSelected('asset') || Editor.Selection.getSelected('asset')[0];
+        if (!selectedAsset) {
+            return null;
+        }
+
+        const url = await resolveAssetUrl(String(selectedAsset));
+        if (url && /\.(prefab|scene)$/i.test(url)) {
+            return url;
+        }
+    } catch {
+        // ignore and fall through
+    }
+
+    return null;
+}
+
+async function resolveAssetUrl(idOrUrl: string): Promise<string | null> {
+    try {
+        const asset = await Editor.Message.request('asset-db', 'query-asset-info', idOrUrl);
+        if (asset?.url) {
+            return String(asset.url);
+        }
+        if (asset?.source) {
+            return String(asset.source);
+        }
+    } catch {
+        // continue
+    }
+
+    try {
+        const url = await Editor.Message.request('asset-db', 'query-url', idOrUrl);
+        return url ? String(url) : null;
+    } catch {
+        return null;
+    }
+}
+
+function extractPrefabAssetUuid(tree: any): string | null {
+    if (!tree || typeof tree !== 'object') {
+        return null;
+    }
+
+    const dumps = [
+        tree.__prefab__,
+        tree._prefab,
+        tree._prefabInstance,
+        readDumpValue(tree.__prefab__),
+        readDumpValue(tree._prefab),
+    ];
+
+    for (const dump of dumps) {
+        if (!dump || typeof dump !== 'object') {
+            continue;
+        }
+
+        const uuid = dump.assetUuid
+            || dump.uuid
+            || dump.asset
+            || readDumpValue(dump.assetUuid)
+            || readDumpValue(dump.uuid)
+            || readDumpValue(dump.asset);
+        if (typeof uuid === 'string' && uuid) {
+            return uuid;
+        }
+
+        if (uuid && typeof uuid === 'object') {
+            const nested = readDumpValue(uuid.uuid) || uuid.uuid || uuid.__uuid__;
+            if (typeof nested === 'string' && nested) {
+                return nested;
+            }
+        }
+    }
+
+    return null;
 }
 
 async function findAssetUrlByNodeTreeWithRetry(selectedTree: any): Promise<string | null> {
@@ -403,8 +535,10 @@ function findAssetUrlByNodeTree(selectedTree: any): string | null {
     }
 
     const rootName = getNodeName(selectedTree);
-    const childNames = new Set(getChildren(selectedTree).map(getNodeName));
+    const treeNodeNames = collectNodeNames(selectedTree);
     const candidates = listAssetFiles(assetsDir, ['.prefab', '.scene']);
+    let bestUrl: string | null = null;
+    let bestScore = Number.NEGATIVE_INFINITY;
 
     for (const file of candidates) {
         try {
@@ -413,18 +547,13 @@ function findAssetUrlByNodeTree(selectedTree: any): string | null {
                 continue;
             }
 
-            const nodes = data.filter((item) => item?.__type__ === 'cc.Node');
-            const hasRoot = nodes.some((node) => node?._name === rootName);
-            if (!hasRoot) {
+            const score = scoreAssetMatch(file, data, rootName, treeNodeNames);
+            if (score <= bestScore) {
                 continue;
             }
 
-            const nodeNames = new Set(nodes.map((node) => node?._name).filter(Boolean));
-            const childMatchCount = [...childNames].filter((name) => nodeNames.has(name)).length;
-            if (childNames.size === 0 || childMatchCount > 0 || basename(file, extname(file)) === rootName) {
-                const assetRelative = relative(Editor.Project.path, file).replace(/\\/g, '/');
-                return `db://${assetRelative}`;
-            }
+            bestScore = score;
+            bestUrl = `db://${relative(Editor.Project.path, file).replace(/\\/g, '/')}`;
         } catch (error) {
             if (!isIncompleteJsonError(error)) {
                 console.warn(`[${PACKAGE_NAME}] Failed to inspect asset ${file}.`, error);
@@ -432,7 +561,41 @@ function findAssetUrlByNodeTree(selectedTree: any): string | null {
         }
     }
 
-    return null;
+    return bestScore > 0 ? bestUrl : null;
+}
+
+function collectNodeNames(node: any, result: string[] = []): string[] {
+    result.push(getNodeName(node));
+    for (const child of getChildren(node)) {
+        collectNodeNames(child, result);
+    }
+    return result;
+}
+
+function scoreAssetMatch(file: string, data: any[], rootName: string, treeNodeNames: string[]): number {
+    const nodes = data.filter((item) => item?.__type__ === 'cc.Node');
+    const hasRoot = nodes.some((node) => node?._name === rootName);
+    if (!hasRoot) {
+        return Number.NEGATIVE_INFINITY;
+    }
+
+    const assetNames = nodes.map((node) => String(node?._name || '')).filter(Boolean);
+    const assetNameSet = new Set(assetNames);
+    const matchedCount = treeNodeNames.filter((name) => assetNameSet.has(name)).length;
+    if (matchedCount <= 0 && basename(file, extname(file)) !== rootName) {
+        return Number.NEGATIVE_INFINITY;
+    }
+
+    let score = matchedCount * 10;
+    score -= Math.abs(assetNames.length - treeNodeNames.length) * 3;
+    if (basename(file, extname(file)) === rootName) {
+        score += 5;
+    }
+
+    // Prefer unique structural matches when duplicate prefabs exist under different folders.
+    score += Math.min(matchedCount, assetNames.length);
+
+    return score;
 }
 
 function readJsonFileSync(file: string): any | null {
@@ -481,37 +644,97 @@ function listAssetFiles(dir: string, extensions: string[]): string[] {
 }
 
 function makeScriptUrl(openedAssetUrl: string | null, className: string, scriptRoot: string): string {
-    const normalizedRoot = normalizeAssetPath(scriptRoot || defaultConfig.scriptRoot).replace(/\/+$/, '');
-    const rootScriptUrl = `db://${normalizedRoot}/${className}.ts`;
-    if (assetUrlExists(rootScriptUrl)) {
-        return rootScriptUrl;
+    const relativeRoot = normalizeRelativeScriptRoot(scriptRoot);
+    const baseDir = getScriptBaseDir(openedAssetUrl);
+    const resolvedDir = resolveRelativeAssetPath(baseDir, relativeRoot);
+    return `db://${resolvedDir}/${className}.ts`;
+}
+
+function getScriptBaseDir(openedAssetUrl: string | null): string {
+    if (openedAssetUrl) {
+        const bundleRoot = findBundleRoot(openedAssetUrl);
+        if (bundleRoot) {
+            return bundleRoot;
+        }
     }
 
-    if (!openedAssetUrl) {
-        return rootScriptUrl;
+    // Prefab/scene is not inside an Asset Bundle: resolve relative to project assets root.
+    return 'assets';
+}
+
+function findBundleRoot(openedAssetUrl: string): string | null {
+    let current = getOpenedAssetDirectory(openedAssetUrl);
+
+    while (current) {
+        if (isBundleDirectory(current)) {
+            return current;
+        }
+
+        if (current === 'assets' || !current.includes('/')) {
+            break;
+        }
+
+        current = current.slice(0, current.lastIndexOf('/'));
     }
 
+    return null;
+}
+
+function isBundleDirectory(assetRelativeDir: string): boolean {
+    const metaPath = join(Editor.Project.path, `${assetRelativeDir}.meta`);
+    if (!existsSync(metaPath)) {
+        return false;
+    }
+
+    try {
+        const meta = JSON.parse(readFileSync(metaPath, 'utf8'));
+        return meta?.userData?.isBundle === true;
+    } catch {
+        return false;
+    }
+}
+
+function getOpenedAssetDirectory(openedAssetUrl: string): string {
     const assetPath = openedAssetUrl
         .replace(/^db:\/\//, '')
-        .replace(/\.(prefab|scene)$/i, '')
-        .replace(/\\/g, '/');
+        .replace(/\\/g, '/')
+        .replace(/\/+$/, '');
 
-    const relativePath = assetPath.startsWith('assets/')
-        ? assetPath.slice('assets/'.length)
-        : assetPath.replace(/^.*?assets\//, '');
-    const dir = relativePath.includes('/') ? relativePath.slice(0, relativePath.lastIndexOf('/')) : '';
+    const lastSlash = assetPath.lastIndexOf('/');
+    if (lastSlash < 0) {
+        return 'assets';
+    }
 
-    return `db://${normalizedRoot}${dir ? `/${dir}` : ''}/${className}.ts`;
+    return assetPath.slice(0, lastSlash) || 'assets';
 }
 
-function assetUrlExists(url: string): boolean {
-    const relativePath = url.replace(/^db:\/\//, '').replace(/\//g, '\\');
-    return existsSync(join(Editor.Project.path, relativePath));
+function normalizeRelativeScriptRoot(scriptRoot: string): string {
+    const value = String(scriptRoot || defaultConfig.scriptRoot).trim().replace(/\\/g, '/') || '.';
+    return value.replace(/\/+$/, '') || '.';
 }
 
-function normalizeAssetPath(value: string): string {
-    const path = value.replace(/\\/g, '/').replace(/^db:\/\//, '').replace(/^\/+/, '');
-    return path.startsWith('assets') ? path : `assets/${path}`;
+function resolveRelativeAssetPath(baseDir: string, relativePath: string): string {
+    const baseParts = baseDir.replace(/\\/g, '/').split('/').filter(Boolean);
+    const relativeParts = relativePath.replace(/\\/g, '/').split('/').filter(Boolean);
+    const parts = [...baseParts];
+
+    for (const part of relativeParts) {
+        if (part === '.') {
+            continue;
+        }
+
+        if (part === '..') {
+            if (parts.length > 0) {
+                parts.pop();
+            }
+            continue;
+        }
+
+        parts.push(part);
+    }
+
+    const resolved = parts.join('/') || 'assets';
+    return resolved.startsWith('assets') ? resolved : `assets/${resolved}`;
 }
 
 function scanBindings(root: any, config: BindToolConfig): ScannedBinding[] {
@@ -595,6 +818,22 @@ function readDumpValue(value: any): any {
 function toClassName(value: string): string {
     const name = toPropertyName(value);
     return upperFirst(name.replace(/^_+/, '') || 'AutoBindComponent');
+}
+
+function applyScriptNamePrefix(className: string, prefix: string): string {
+    const safePrefix = String(prefix || '')
+        .trim()
+        .replace(/[^\p{ID_Start}\p{ID_Continue}$_\u200C\u200D]+/gu, '');
+
+    if (!safePrefix || !isIdentifierStart(safePrefix[0])) {
+        return className;
+    }
+
+    if (className.toLowerCase().startsWith(safePrefix.toLowerCase())) {
+        return className;
+    }
+
+    return `${safePrefix}${className}`;
 }
 
 function toPropertyName(value: string): string {
