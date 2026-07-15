@@ -172,7 +172,13 @@ export const methods: { [key: string]: (...args: any[]) => any } = {
     async bindSelectedNodeReferences() {
         await runBindSelectedNode('bind');
     },
+
+    async bindUiOnSelectedNode() {
+        await runBindUiOnSelectedNode();
+    },
 };
+
+const BIND_MARKER_HINT = `在需要绑定节点的脚本添加 ${AUTO_BIND_START} ${AUTO_BIND_END}`;
 
 async function runBindSelectedNode(mode: BindMode): Promise<void> {
     const modeTitle = getModeTitle(mode);
@@ -220,9 +226,434 @@ function getModeTitle(mode: BindMode): string {
     return 'Generate and bind';
 }
 
+async function runBindUiOnSelectedNode(): Promise<void> {
+    try {
+        const result = await bindUiOnSelectedNode();
+        Editor.Task.addNotice({
+            title: '绑定UI complete',
+            message: [
+                `Script: ${result.scriptUrl}`,
+                `Properties: ${result.bindings.length}`,
+                `Button events: ${result.buttons.length}`,
+                `Bound references: ${result.propertiesBound}`,
+            ].join('\n'),
+            type: 'success',
+            source: PACKAGE_NAME,
+            timeout: 6000,
+        });
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`[${PACKAGE_NAME}] ${message}`, error);
+        Editor.Task.addNotice({
+            title: '绑定UI failed',
+            message,
+            type: 'error',
+            source: PACKAGE_NAME,
+            timeout: 8000,
+        });
+    }
+}
+
 export function load() {}
 
 export function unload() {}
+
+async function bindUiOnSelectedNode(): Promise<BindResult> {
+    const selectedUuid = Editor.Selection.getLastSelected('node') || Editor.Selection.getSelected('node')[0];
+    if (!selectedUuid) {
+        throw new Error('Please select a node first.');
+    }
+
+    console.log(`[${PACKAGE_NAME}] Bind UI selectedUuid: ${selectedUuid}`);
+    const selectedTree = await querySelectedNodeTree(selectedUuid);
+    if (!selectedTree) {
+        throw new Error('Cannot read the selected node. Make sure a scene or prefab is open.');
+    }
+
+    console.log(`[${PACKAGE_NAME}] Selected tree root: ${getNodeName(selectedTree)}, children: ${getChildren(selectedTree).map(getNodeName).join(', ')}`);
+
+    const scripts = await listScriptsOnNode(selectedUuid);
+    console.log(`[${PACKAGE_NAME}] Scripts on node (${scripts.length}): ${scripts.map((item) => `${item.className}@${item.scriptUrl}`).join(' | ') || '(none)'}`);
+    if (scripts.length === 0) {
+        const tip = `选中节点上没有脚本组件。${BIND_MARKER_HINT}`;
+        console.warn(`[${PACKAGE_NAME}] ${tip}`);
+        throw new Error(tip);
+    }
+
+    const targetScript = pickBindUiTargetScript(scripts, getNodeName(selectedTree));
+    if (!targetScript) {
+        console.warn(`[${PACKAGE_NAME}] ${BIND_MARKER_HINT}`);
+        for (const script of scripts) {
+            console.warn(`[${PACKAGE_NAME}] Checked script without bind markers: ${script.scriptUrl}`);
+        }
+        throw new Error(BIND_MARKER_HINT);
+    }
+
+    const config = await readConfig();
+    const className = targetScript.className
+        || extractClassNameFromSource(targetScript.source)
+        || applyScriptNamePrefix(toClassName(getNodeName(selectedTree)), config.scriptNamePrefix);
+    const openedAssetUrl = await queryOpenedAssetUrl(selectedTree);
+    if (!openedAssetUrl) {
+        throw new Error('Cannot locate the opened prefab or scene asset. Please save the prefab/scene and run bind again.');
+    }
+
+    const scriptUrl = targetScript.scriptUrl;
+    const scriptBaseDir = getScriptBaseDir(openedAssetUrl);
+    console.log(`[${PACKAGE_NAME}] Bind UI target script: ${scriptUrl}`);
+    console.log(`[${PACKAGE_NAME}] Bind UI className: ${className}, componentUuid: ${targetScript.componentUuid}, cid: ${targetScript.cid}`);
+    console.log(`[${PACKAGE_NAME}] Opened asset: ${openedAssetUrl}`);
+    console.log(`[${PACKAGE_NAME}] Enabled rules: ${getSortedEnabledRules(config).map((rule) => rule.prefix).join(', ')}`);
+
+    const scan = scanBindings(selectedTree, config);
+    console.log(`[${PACKAGE_NAME}] Scan bindings (${scan.length}): ${scan.map((item) => `${item.propertyName}:${item.propertyType}@${item.nodeName}`).join(' | ') || '(none)'}`);
+    const buttons = scan.filter((item) => item.generateClickEvent);
+    const generated = renderScript(className, scan, buttons);
+    const finalSource = updateUiMarkedSource(targetScript.source, generated);
+
+    const sourceChanged = finalSource !== targetScript.source;
+    if (sourceChanged) {
+        await writeAsset(scriptUrl, finalSource, false);
+        await Editor.Message.request('asset-db', 'refresh-asset', scriptUrl);
+        // Script reimport remounts the component; previous component UUID becomes invalid.
+        targetScript.componentUuid = '';
+        await delay(300);
+        console.log(`[${PACKAGE_NAME}] Script updated and refreshed: ${scriptUrl}`);
+    } else {
+        console.log(`[${PACKAGE_NAME}] Script content unchanged, skip refresh: ${scriptUrl}`);
+    }
+
+    await ensureButtonComponents(buttons, config);
+    const liveComponentUuid = await waitForBindableComponent(
+        selectedUuid,
+        className,
+        scriptUrl,
+        scan.map((item) => item.propertyName),
+        targetScript,
+    );
+    targetScript.componentUuid = liveComponentUuid || '';
+    console.log(`[${PACKAGE_NAME}] Live componentUuid for binding: ${targetScript.componentUuid || '(missing)'}`);
+
+    const propertiesBound = await applyBindings(
+        selectedUuid,
+        className,
+        scriptUrl,
+        openedAssetUrl,
+        selectedTree,
+        scan,
+        targetScript,
+    );
+    const componentAttached = Boolean(targetScript.componentUuid);
+
+    return {
+        className,
+        scriptUrl,
+        openedAssetUrl,
+        scriptBaseDir,
+        bindings: scan,
+        buttons,
+        created: false,
+        componentAttached,
+        propertiesBound,
+    };
+}
+
+interface NodeScriptInfo {
+    className: string;
+    scriptUrl: string;
+    source: string;
+    componentUuid: string;
+    cid: string;
+}
+
+function pickBindUiTargetScript(scripts: NodeScriptInfo[], nodeName: string): NodeScriptInfo | undefined {
+    const withMarkers = scripts.filter((script) => hasBindMarkers(script.source));
+    if (withMarkers.length === 0) {
+        return undefined;
+    }
+
+    const lowerNodeName = nodeName.toLowerCase();
+    const byClassName = withMarkers.find((script) => script.className.toLowerCase() === lowerNodeName);
+    if (byClassName) {
+        return byClassName;
+    }
+
+    const byFileName = withMarkers.find((script) => {
+        const fileName = basename(script.scriptUrl).replace(/\.tsx?$/i, '').toLowerCase();
+        return fileName === lowerNodeName || lowerNodeName.startsWith(fileName);
+    });
+    if (byFileName) {
+        return byFileName;
+    }
+
+    return withMarkers[0];
+}
+
+async function querySelectedNodeTree(selectedUuid: string): Promise<any | null> {
+    const direct = await Editor.Message.request('scene', 'query-node-tree', selectedUuid);
+    if (direct && (getChildren(direct).length > 0 || getUuid(direct) === selectedUuid)) {
+        if (getChildren(direct).length === 0) {
+            try {
+                const root = await Editor.Message.request('scene', 'query-node-tree');
+                const found = findNodeInTree(root, selectedUuid);
+                if (found && getChildren(found).length > 0) {
+                    console.log(`[${PACKAGE_NAME}] Selected tree recovered from full scene tree.`);
+                    return found;
+                }
+            } catch (error) {
+                console.warn(`[${PACKAGE_NAME}] Failed to recover selected tree from full scene tree.`, error);
+            }
+        }
+        return direct;
+    }
+
+    try {
+        const root = await Editor.Message.request('scene', 'query-node-tree');
+        return findNodeInTree(root, selectedUuid) || direct;
+    } catch {
+        return direct;
+    }
+}
+
+function findNodeInTree(node: any, uuid: string): any | null {
+    if (!node) {
+        return null;
+    }
+    if (getUuid(node) === uuid) {
+        return node;
+    }
+    for (const child of getChildren(node)) {
+        const found = findNodeInTree(child, uuid);
+        if (found) {
+            return found;
+        }
+    }
+    return null;
+}
+
+async function listScriptsOnNode(nodeUuid: string): Promise<NodeScriptInfo[]> {
+    const node = await Editor.Message.request('scene', 'query-node', nodeUuid);
+    const components = Array.isArray(node?.__comps__) ? node.__comps__ : [];
+    console.log(`[${PACKAGE_NAME}] query-node comps count: ${components.length}`);
+    if (components.length === 0) {
+        return [];
+    }
+
+    let registered: Array<{ name?: string; cid?: string; path?: string; assetUuid?: string }> = [];
+    try {
+        const list = await Editor.Message.request('scene', 'query-components');
+        registered = Array.isArray(list) ? list : [];
+    } catch (error) {
+        console.warn(`[${PACKAGE_NAME}] Failed to query registered components.`, error);
+    }
+
+    const results: NodeScriptInfo[] = [];
+    const seenUrls = new Set<string>();
+
+    for (const component of components) {
+        const componentAny = component as any;
+        const type = String(readDumpValue(componentAny?.type) || '');
+        const cid = String(readDumpValue(componentAny?.cid) || type || '');
+        const componentUuid = String(
+            readDumpValue(componentAny?.value?.uuid)
+            || readDumpValue(componentAny?.uuid)
+            || '',
+        );
+        const typeCandidates = [type, cid]
+            .map(readDumpValue)
+            .filter(Boolean)
+            .map(String);
+
+        console.log(`[${PACKAGE_NAME}] Comp dump type=${type}, cid=${cid}, uuid=${componentUuid}`);
+
+        if (typeCandidates.length === 0 || typeCandidates.every((candidate) => isBuiltinComponentType(candidate))) {
+            continue;
+        }
+
+        const matched = findRegisteredScriptComponent(registered, typeCandidates);
+        console.log(`[${PACKAGE_NAME}] Registered match: ${matched ? `${matched.name}|${matched.cid}|${matched.path}|${matched.assetUuid}` : '(none)'}`);
+
+        const assetKeys = [
+            matched?.assetUuid,
+            matched?.path,
+            ...typeCandidates,
+        ].filter(Boolean).map(String);
+
+        let resolved: NodeScriptInfo | null = null;
+        for (const key of assetKeys) {
+            resolved = await resolveScriptAssetByKey(key, typeCandidates, componentUuid, cid || type);
+            if (resolved) {
+                break;
+            }
+        }
+
+        if (!resolved) {
+            console.warn(`[${PACKAGE_NAME}] Failed to resolve script asset for component type=${type}`);
+            continue;
+        }
+
+        if (seenUrls.has(resolved.scriptUrl)) {
+            continue;
+        }
+
+        seenUrls.add(resolved.scriptUrl);
+        results.push(resolved);
+    }
+
+    return results;
+}
+
+function findRegisteredScriptComponent(
+    registered: Array<{ name?: string; cid?: string; path?: string; assetUuid?: string }>,
+    typeCandidates: string[],
+): { name?: string; cid?: string; path?: string; assetUuid?: string } | undefined {
+    return registered.find((item) => {
+        const regCandidates = [item?.name, item?.cid, item?.assetUuid]
+            .filter(Boolean)
+            .map(String);
+        return typeCandidates.some((candidate) => regCandidates.some((reg) => isExactComponentIdentity(reg, candidate)));
+    });
+}
+
+function isExactComponentIdentity(left: string, right: string): boolean {
+    const a = String(left || '').trim().toLowerCase();
+    const b = String(right || '').trim().toLowerCase();
+    if (!a || !b) {
+        return false;
+    }
+    return a === b
+        || shortTypeName(a).toLowerCase() === shortTypeName(b).toLowerCase();
+}
+
+async function resolveScriptAssetByKey(
+    key: string,
+    classNameCandidates: string[],
+    componentUuid: string,
+    cid: string,
+): Promise<NodeScriptInfo | null> {
+    try {
+        const asset = await Editor.Message.request('asset-db', 'query-asset-info', key);
+        if (!asset?.file || !/\.tsx?$/i.test(String(asset.file))) {
+            return null;
+        }
+
+        const scriptUrl = String(asset.url || asset.source || '');
+        if (!scriptUrl) {
+            return null;
+        }
+
+        const source = readFileSync(String(asset.file), 'utf8');
+        const className = extractClassNameFromSource(source)
+            || classNameCandidates.find((name) => !isBuiltinComponentType(name) && !looksLikeUuid(name) && !looksLikeCid(name))
+            || basename(String(asset.file), extname(String(asset.file)));
+
+        return {
+            className,
+            scriptUrl,
+            source,
+            componentUuid,
+            cid,
+        };
+    } catch {
+        return null;
+    }
+}
+
+function isBuiltinComponentType(typeName: string): boolean {
+    const value = String(typeName || '').trim();
+    if (!value) {
+        return true;
+    }
+
+    if (value.startsWith('cc.') || value.startsWith('sp.')) {
+        return true;
+    }
+
+    const builtins = [
+        'Node',
+        'UITransform',
+        'Sprite',
+        'Label',
+        'Button',
+        'Widget',
+        'Canvas',
+        'Camera',
+        'RichText',
+        'EditBox',
+        'ScrollView',
+        'Layout',
+        'Mask',
+        'Graphics',
+        'ProgressBar',
+        'Toggle',
+        'Slider',
+        'BlockInputEvents',
+    ];
+
+    const short = shortTypeName(value);
+    return builtins.some((name) => name.toLowerCase() === short.toLowerCase() || name.toLowerCase() === value.toLowerCase());
+}
+
+function looksLikeCid(value: string): boolean {
+    return /[+/]/.test(value) || (value.length >= 20 && /[A-Za-z]/.test(value) && /\d/.test(value));
+}
+
+function looksLikeUuid(value: string): boolean {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+        || /^[0-9a-f]{20,}$/i.test(value);
+}
+
+function extractClassNameFromSource(source: string): string | null {
+    const ccclassMatch = source.match(/@ccclass\(\s*['"]([^'"]+)['"]\s*\)/);
+    if (ccclassMatch?.[1]) {
+        return ccclassMatch[1];
+    }
+
+    const classMatch = source.match(/export\s+class\s+([A-Za-z_$][\w$]*)\s+extends\s+/);
+    return classMatch?.[1] || null;
+}
+
+function hasBindMarkers(source: string): boolean {
+    return hasBlock(source, AUTO_BIND_START, AUTO_BIND_END)
+        || hasBlock(source, LEGACY_AUTO_BIND_START, LEGACY_AUTO_BIND_END);
+}
+
+function updateUiMarkedSource(existing: string, generated: string): string {
+    if (!hasBindMarkers(existing)) {
+        return existing;
+    }
+
+    const bindBlock = pickBlock(generated, AUTO_BIND_START, AUTO_BIND_END);
+    const bindMarkers = getExistingBlockMarkers(existing, AUTO_BIND_START, AUTO_BIND_END)
+        || getExistingBlockMarkers(existing, LEGACY_AUTO_BIND_START, LEGACY_AUTO_BIND_END)
+        || ([AUTO_BIND_START, AUTO_BIND_END] as const);
+
+    let updated = replaceBlock(existing, bindMarkers[0], bindMarkers[1], bindBlock);
+    updated = updated.replace(bindMarkers[0], AUTO_BIND_START).replace(bindMarkers[1], AUTO_BIND_END);
+
+    if (hasBlock(updated, AUTO_BUTTON_EVENT_START, AUTO_BUTTON_EVENT_END)) {
+        updated = replaceBlock(
+            updated,
+            AUTO_BUTTON_EVENT_START,
+            AUTO_BUTTON_EVENT_END,
+            pickBlock(generated, AUTO_BUTTON_EVENT_START, AUTO_BUTTON_EVENT_END),
+        );
+    }
+
+    if (hasBlock(updated, AUTO_BUTTON_HANDLER_START, AUTO_BUTTON_HANDLER_END)) {
+        updated = replaceBlock(
+            updated,
+            AUTO_BUTTON_HANDLER_START,
+            AUTO_BUTTON_HANDLER_END,
+            mergeButtonHandlerBlock(
+                pickBlock(updated, AUTO_BUTTON_HANDLER_START, AUTO_BUTTON_HANDLER_END),
+                pickBlock(generated, AUTO_BUTTON_HANDLER_START, AUTO_BUTTON_HANDLER_END),
+            ),
+        );
+    }
+
+    return mergeCcImports(updated, generated);
+}
 
 async function bindSelectedNode(mode: BindMode): Promise<BindResult> {
     const selectedUuid = Editor.Selection.getLastSelected('node') || Editor.Selection.getSelected('node')[0];
@@ -272,14 +703,15 @@ async function bindSelectedNode(mode: BindMode): Promise<BindResult> {
     if (mode !== 'generate') {
         await ensureButtonComponents(buttons, config);
         componentAttached = await tryAttachComponent(selectedUuid, className, scriptUrl);
-
-        try {
-            await Editor.Message.request('scene', 'save-scene');
-            propertiesBound = await bindSerializedAssetReferences(openedAssetUrl, scriptUrl, selectedUuid, className, getNodeName(selectedTree), scan);
-            await Editor.Message.request('asset-db', 'refresh-asset', openedAssetUrl);
-        } catch (error) {
-            console.warn(`[${PACKAGE_NAME}] Failed to save the current scene or prefab. Please save manually.`, error);
-        }
+        propertiesBound = await applyBindings(
+            selectedUuid,
+            className,
+            scriptUrl,
+            openedAssetUrl,
+            selectedTree,
+            scan,
+            null,
+        );
     }
 
     return {
@@ -805,7 +1237,20 @@ function getUuid(node: any): string {
 }
 
 function getChildren(node: any): any[] {
-    return Array.isArray(node?.children) ? node.children : [];
+    if (Array.isArray(node?.children)) {
+        return node.children;
+    }
+
+    const dumpChildren = readDumpValue(node?.children);
+    if (Array.isArray(dumpChildren)) {
+        return dumpChildren;
+    }
+
+    if (Array.isArray(node?.value?.children)) {
+        return node.value.children;
+    }
+
+    return [];
 }
 
 function readDumpValue(value: any): any {
@@ -1341,39 +1786,212 @@ function normalizeClassName(className: string): string {
     return className.replace(/[^A-Za-z0-9_$\p{ID_Start}\p{ID_Continue}\u200C\u200D]/gu, '_');
 }
 
-async function bindComponentProperties(nodeUuid: string, className: string, scriptUrl: string, bindings: ScannedBinding[]): Promise<number> {
-    const scriptAsset = await queryAssetInfoSafe(scriptUrl);
-    const componentUuid = await findComponentUuid(nodeUuid, getSerializedScriptTypeNames(scriptAsset, className));
-    if (!componentUuid) {
-        console.warn(`[${PACKAGE_NAME}] Cannot find component ${className} for property binding.`);
+async function applyBindings(
+    selectedUuid: string,
+    className: string,
+    scriptUrl: string,
+    openedAssetUrl: string | null,
+    selectedTree: any,
+    bindings: ScannedBinding[],
+    targetScript?: NodeScriptInfo | null,
+): Promise<number> {
+    if (bindings.length === 0) {
+        console.warn(`[${PACKAGE_NAME}] applyBindings skipped because scan result is empty.`);
         return 0;
     }
 
-    const componentDump = await Editor.Message.request('scene', 'query-component', componentUuid);
+    let propertiesBound = await bindComponentProperties(selectedUuid, className, scriptUrl, bindings, targetScript);
+    console.log(`[${PACKAGE_NAME}] Scene API bound ${propertiesBound}/${bindings.length} properties.`);
+
+    if (propertiesBound >= bindings.length) {
+        try {
+            await Editor.Message.request('scene', 'save-scene');
+        } catch (error) {
+            console.warn(`[${PACKAGE_NAME}] Failed to save scene after property binding.`, error);
+        }
+        return propertiesBound;
+    }
+
+    // Do NOT save-scene before serialized fallback: that would persist empty live refs and fight the file write.
+    try {
+        const serializedBound = await bindSerializedAssetReferences(
+            openedAssetUrl,
+            scriptUrl,
+            selectedUuid,
+            className,
+            selectedTree,
+            bindings,
+        );
+        console.log(`[${PACKAGE_NAME}] Serialized asset bound ${serializedBound}/${bindings.length} properties.`);
+        if (serializedBound > propertiesBound) {
+            propertiesBound = serializedBound;
+        }
+        if (openedAssetUrl && serializedBound > 0) {
+            await Editor.Message.request('asset-db', 'refresh-asset', openedAssetUrl);
+            try {
+                await Editor.Message.request('scene', 'soft-reload');
+            } catch {
+                // ignore
+            }
+            // Prefab stage may keep stale memory; reopen forces inspector to load disk bindings.
+            try {
+                await Editor.Message.request('scene', 'open-scene', openedAssetUrl);
+                console.log(`[${PACKAGE_NAME}] Reopened asset after serialized bind: ${openedAssetUrl}`);
+            } catch (error) {
+                console.warn(`[${PACKAGE_NAME}] Failed to reopen asset after serialized bind.`, error);
+            }
+        }
+    } catch (error) {
+        console.warn(`[${PACKAGE_NAME}] Failed to bind serialized prefab/scene references.`, error);
+    }
+
+    return propertiesBound;
+}
+
+async function waitForBindableComponent(
+    nodeUuid: string,
+    className: string,
+    scriptUrl: string,
+    propertyNames: string[],
+    targetScript?: NodeScriptInfo | null,
+): Promise<string | null> {
+    const scriptAsset = await queryAssetInfoSafe(scriptUrl);
+    const typeNames = [...new Set([
+        ...(targetScript?.cid ? [targetScript.cid] : []),
+        ...(targetScript?.className ? [targetScript.className] : []),
+        className,
+        ...getSerializedScriptTypeNames(scriptAsset, className),
+    ].filter(Boolean))];
+    const deadline = Date.now() + 12000;
+    let logged = false;
+
+    while (Date.now() < deadline) {
+        // Always re-query from node. Cached UUID is invalid after script reimport.
+        const componentUuid = await findComponentUuid(nodeUuid, typeNames);
+        if (componentUuid) {
+            if (propertyNames.length === 0) {
+                return componentUuid;
+            }
+
+            try {
+                const componentDump = await Editor.Message.request('scene', 'query-component', componentUuid);
+                const readyNames = propertyNames.filter((name) => Boolean(getPropertyDump(componentDump, name)));
+                if (readyNames.length === propertyNames.length) {
+                    console.log(`[${PACKAGE_NAME}] Bindable component ready: ${componentUuid}`);
+                    return componentUuid;
+                }
+                if (!logged) {
+                    console.log(`[${PACKAGE_NAME}] Waiting properties ready ${readyNames.length}/${propertyNames.length} on ${componentUuid}`);
+                }
+            } catch {
+                // keep waiting for script reimport
+            }
+        }
+
+        if (!logged) {
+            console.log(`[${PACKAGE_NAME}] Waiting for bindable properties on ${className}, types=${typeNames.join(',')}`);
+            logged = true;
+        }
+        await delay(300);
+    }
+
+    return findComponentUuid(nodeUuid, typeNames);
+}
+
+async function bindComponentProperties(
+    nodeUuid: string,
+    className: string,
+    scriptUrl: string,
+    bindings: ScannedBinding[],
+    targetScript?: NodeScriptInfo | null,
+): Promise<number> {
+    const typeNames = [
+        ...(targetScript?.cid ? [targetScript.cid] : []),
+        ...(targetScript?.className ? [targetScript.className] : []),
+        className,
+    ].filter(Boolean);
+
+    const componentUuid = await waitForBindableComponent(
+        nodeUuid,
+        className,
+        scriptUrl,
+        bindings.map((item) => item.propertyName),
+        targetScript,
+    );
+    if (!componentUuid) {
+        console.warn(`[${PACKAGE_NAME}] Cannot find component ${className} for property binding. cid=${targetScript?.cid || ''}`);
+        return 0;
+    }
+
+    const componentIndex = await findComponentIndexOnNode(nodeUuid, typeNames.length > 0 ? typeNames : [componentUuid]);
+    console.log(`[${PACKAGE_NAME}] Binding through componentUuid=${componentUuid}, compsIndex=${componentIndex}`);
     let boundCount = 0;
 
     for (const binding of bindings) {
-        const propertyDump = getPropertyDump(componentDump, binding.propertyName);
+        let propertyDump: any | null = null;
+        try {
+            const componentDump = await Editor.Message.request('scene', 'query-component', componentUuid);
+            propertyDump = getPropertyDump(componentDump, binding.propertyName);
+            if (!propertyDump) {
+                console.warn(`[${PACKAGE_NAME}] Property dump missing for ${binding.propertyName}. dump keys=${Object.keys(componentDump?.value || componentDump || {}).join(',')}`);
+            }
+        } catch (error) {
+            console.warn(`[${PACKAGE_NAME}] Failed to query component dump for ${binding.propertyName}.`, error);
+        }
+
         if (!propertyDump) {
-            console.warn(`[${PACKAGE_NAME}] Cannot find property dump ${binding.propertyName}.`);
             continue;
         }
 
         const targetUuid = binding.bindTarget === 'node'
             ? binding.nodeUuid
-            : await findComponentUuid(binding.nodeUuid, binding.componentType || binding.propertyType);
+            : await findComponentUuid(binding.nodeUuid, [
+                binding.componentType,
+                binding.propertyType,
+                shortTypeName(binding.componentType || ''),
+                shortTypeName(binding.propertyType || ''),
+            ].filter(Boolean));
 
         if (!targetUuid) {
-            console.warn(`[${PACKAGE_NAME}] Cannot find target for ${binding.propertyName}.`);
+            console.warn(`[${PACKAGE_NAME}] Cannot find target for ${binding.propertyName} on node ${binding.nodeName} (${binding.nodeUuid}).`);
             continue;
         }
 
-        if (await setReferenceProperty(componentUuid, binding.propertyName, propertyDump, targetUuid)) {
+        console.log(`[${PACKAGE_NAME}] set-property ${binding.propertyName} -> ${targetUuid} (${binding.bindTarget}/${binding.propertyType})`);
+        if (await setReferenceProperty(nodeUuid, componentUuid, componentIndex, binding.propertyName, propertyDump, targetUuid)) {
             boundCount += 1;
+        } else {
+            console.warn(`[${PACKAGE_NAME}] set-property failed for ${binding.propertyName}.`);
         }
     }
 
     return boundCount;
+}
+
+async function findComponentIndexOnNode(nodeUuid: string, matchNames: string[]): Promise<number> {
+    const node = await Editor.Message.request('scene', 'query-node', nodeUuid);
+    const components = Array.isArray(node?.__comps__) ? node.__comps__ : [];
+
+    for (let index = 0; index < components.length; index += 1) {
+        const componentAny = components[index] as any;
+        const uuid = String(readDumpValue(componentAny?.value?.uuid) || readDumpValue(componentAny?.uuid) || '');
+        const candidates = [
+            uuid,
+            componentAny?.type,
+            componentAny?.name,
+            componentAny?.cid,
+            componentAny?.value?.name,
+            componentAny?.value?.__type__,
+            componentAny?.value?.cid,
+            componentAny?.value?.type,
+        ].map(readDumpValue).filter(Boolean).map(String);
+
+        if (candidates.some((candidate) => matchNames.some((name) => isExactComponentIdentity(String(name), candidate) || matchesComponentName(candidate, String(name))))) {
+            return index;
+        }
+    }
+
+    return -1;
 }
 
 async function findComponentUuid(nodeUuid: string, componentName: string | string[]): Promise<string | null> {
@@ -1407,21 +2025,43 @@ function getPropertyDump(componentDump: any, propertyName: string): any | null {
     return dump && typeof dump === 'object' ? dump : null;
 }
 
-async function setReferenceProperty(componentUuid: string, propertyName: string, propertyDump: any, targetUuid: string): Promise<boolean> {
+async function setReferenceProperty(
+    nodeUuid: string,
+    componentUuid: string,
+    componentIndex: number,
+    propertyName: string,
+    propertyDump: any,
+    targetUuid: string,
+): Promise<boolean> {
     const candidates = makeReferenceDumpCandidates(propertyDump, targetUuid);
+    const attempts: Array<{ uuid: string; path: string }> = [];
 
-    for (const dump of candidates) {
-        try {
-            await Editor.Message.request('scene', 'set-property', {
-                uuid: componentUuid,
-                path: propertyName,
-                dump,
-                record: true,
-            });
-            return true;
-        } catch (error) {
-            console.warn(`[${PACKAGE_NAME}] Failed to bind ${propertyName} with one reference dump candidate.`, error);
+    // Prefab editing mode often rejects component UUID for set-property; prefer node path first.
+    if (componentIndex >= 0) {
+        attempts.push({ uuid: nodeUuid, path: `__comps__.${componentIndex}.${propertyName}` });
+        attempts.push({ uuid: nodeUuid, path: `components.${componentIndex}.${propertyName}` });
+    }
+    attempts.push({ uuid: componentUuid, path: propertyName });
+
+    for (const attempt of attempts) {
+        for (let index = 0; index < candidates.length; index += 1) {
+            const dump = candidates[index];
+            try {
+                const ok = await Editor.Message.request('scene', 'set-property', {
+                    uuid: attempt.uuid,
+                    path: attempt.path,
+                    dump,
+                    record: true,
+                });
+                if (ok) {
+                    console.log(`[${PACKAGE_NAME}] set-property ok via uuid=${attempt.uuid}, path=${attempt.path}, candidate=${index + 1}`);
+                    return true;
+                }
+            } catch (error) {
+                // try next candidate shape
+            }
         }
+        console.warn(`[${PACKAGE_NAME}] set-property failed for ${propertyName} via uuid=${attempt.uuid}, path=${attempt.path}`);
     }
 
     return false;
@@ -1429,41 +2069,50 @@ async function setReferenceProperty(componentUuid: string, propertyName: string,
 
 function makeReferenceDumpCandidates(propertyDump: any, targetUuid: string): any[] {
     const base = JSON.parse(JSON.stringify(propertyDump));
+    const type = base.type || base.ctype || undefined;
     const candidates: any[] = [];
 
-    candidates.push({
-        ...base,
-        value: {
-            uuid: targetUuid,
-        },
-    });
-
-    candidates.push({
-        ...base,
-        value: targetUuid,
-    });
-
-    candidates.push({
-        ...base,
-        value: {
-            __uuid__: targetUuid,
-        },
-    });
+    const valueShapes = [
+        { uuid: targetUuid },
+        targetUuid,
+        { __uuid__: targetUuid },
+        { value: { uuid: targetUuid } },
+        { uuid: targetUuid, type },
+    ];
 
     if (base.value && typeof base.value === 'object') {
-        candidates.unshift({
-            ...base,
-            value: {
-                ...base.value,
-                uuid: targetUuid,
-            },
+        valueShapes.unshift({
+            ...base.value,
+            uuid: targetUuid,
         });
+    }
+
+    for (const value of valueShapes) {
+        candidates.push({
+            ...base,
+            value,
+        });
+
+        if (type) {
+            candidates.push({
+                ...base,
+                type,
+                value,
+            });
+        }
     }
 
     return candidates;
 }
 
-async function bindSerializedAssetReferences(openedAssetUrl: string | null, scriptUrl: string, selectedUuid: string, className: string, rootName: string, bindings: ScannedBinding[]): Promise<number> {
+async function bindSerializedAssetReferences(
+    openedAssetUrl: string | null,
+    scriptUrl: string,
+    selectedUuid: string,
+    className: string,
+    selectedTree: any,
+    bindings: ScannedBinding[],
+): Promise<number> {
     if (!openedAssetUrl) {
         return 0;
     }
@@ -1478,10 +2127,11 @@ async function bindSerializedAssetReferences(openedAssetUrl: string | null, scri
         return 0;
     }
 
+    const rootName = getNodeName(selectedTree);
+    const selectedChildNames = new Set(collectNodeNames(selectedTree).slice(1));
     const nodeIdByUuid = new Map<string, number>();
-    const nodeIdByName = new Map<string, number>();
-    const componentIdByNodeUuidAndType = new Map<string, number>();
-    const componentIdByNodeNameAndType = new Map<string, number>();
+    const nodeIdsByName = new Map<string, number[]>();
+    const componentIdsByNodeIdAndType = new Map<string, number>();
 
     data.forEach((item, index) => {
         if (item?.__type__ === 'cc.Node') {
@@ -1490,84 +2140,176 @@ async function bindSerializedAssetReferences(openedAssetUrl: string | null, scri
                 nodeIdByUuid.set(nodeUuid, index);
             }
             if (typeof item?._name === 'string') {
-                nodeIdByName.set(item._name, index);
+                const list = nodeIdsByName.get(item._name) || [];
+                list.push(index);
+                nodeIdsByName.set(item._name, list);
             }
         }
     });
 
     data.forEach((item, index) => {
         const nodeId = item?.node?.__id__;
-        const node = Number.isInteger(nodeId) ? data[nodeId] : null;
-        const nodeUuid = node?._id || node?._uuid || '';
-        const nodeName = node?._name || '';
-        if (typeof item?.__type__ !== 'string') {
+        if (!Number.isInteger(nodeId) || typeof item?.__type__ !== 'string') {
             return;
         }
 
-        if (nodeUuid) {
-            componentIdByNodeUuidAndType.set(`${nodeUuid}:${item.__type__}`, index);
-            componentIdByNodeUuidAndType.set(`${nodeUuid}:${shortTypeName(item.__type__)}`, index);
-        }
-
-        if (nodeName) {
-            componentIdByNodeNameAndType.set(`${nodeName}:${item.__type__}`, index);
-            componentIdByNodeNameAndType.set(`${nodeName}:${shortTypeName(item.__type__)}`, index);
-        }
+        componentIdsByNodeIdAndType.set(`${nodeId}:${item.__type__}`, index);
+        componentIdsByNodeIdAndType.set(`${nodeId}:${shortTypeName(item.__type__)}`, index);
     });
 
-    const selectedNodeId = nodeIdByUuid.get(selectedUuid) ?? nodeIdByName.get(rootName);
+    const selectedNodeId = nodeIdByUuid.get(selectedUuid)
+        ?? findSerializedNodeIdByTree(data, rootName, selectedChildNames, nodeIdsByName);
     if (selectedNodeId === undefined) {
+        console.warn(`[${PACKAGE_NAME}] Cannot locate selected node ${rootName} in ${openedAssetUrl}.`);
         return 0;
     }
 
     const scriptAsset = await queryAssetInfoSafe(scriptUrl);
     const scriptTypeNames = getSerializedScriptTypeNames(scriptAsset, className);
     let targetComponent = data.find((item) => {
-        if (typeof item?.__type__ !== 'string') {
+        if (typeof item?.__type__ !== 'string' || item?.node?.__id__ !== selectedNodeId) {
             return false;
         }
 
-        const nodeId = item?.node?.__id__;
-        const node = Number.isInteger(nodeId) ? data[nodeId] : null;
-        const attachedToSelectedNode = nodeId === selectedNodeId || node?._name === rootName;
-        const hasGeneratedProperty = bindings.some((binding) => Object.prototype.hasOwnProperty.call(item, binding.propertyName));
-
-        return scriptTypeNames.includes(item.__type__)
+        const typeMatched = scriptTypeNames.includes(item.__type__)
             || item.__type__ === className
-            || shortTypeName(item.__type__) === className
-            || (attachedToSelectedNode && hasGeneratedProperty);
+            || shortTypeName(item.__type__) === className;
+        const hasGeneratedProperty = bindings.some((binding) => Object.prototype.hasOwnProperty.call(item, binding.propertyName));
+        return typeMatched || hasGeneratedProperty;
     });
 
     if (!targetComponent) {
         targetComponent = appendSerializedScriptComponent(data, selectedNodeId, scriptTypeNames[0] || className, bindings);
     }
 
+    const subtreeNodeIds = collectSerializedSubtreeNodeIds(data, selectedNodeId);
     let boundCount = 0;
 
     for (const binding of bindings) {
+        const targetNodeId = resolveSerializedBindingNodeId(
+            data,
+            binding,
+            selectedNodeId,
+            subtreeNodeIds,
+            nodeIdByUuid,
+            nodeIdsByName,
+        );
+        if (targetNodeId === undefined) {
+            console.warn(`[${PACKAGE_NAME}] Serialized bind missed node for ${binding.propertyName} (${binding.nodeName}).`);
+            continue;
+        }
+
         if (binding.bindTarget === 'node') {
-            const nodeId = nodeIdByUuid.get(binding.nodeUuid) ?? nodeIdByName.get(binding.nodeName);
-            if (nodeId !== undefined) {
-                targetComponent[binding.propertyName] = { __id__: nodeId };
-                boundCount += 1;
-            }
+            targetComponent[binding.propertyName] = { __id__: targetNodeId };
+            boundCount += 1;
             continue;
         }
 
         const typeName = binding.componentType || binding.propertyType;
-        const componentId = componentIdByNodeUuidAndType.get(`${binding.nodeUuid}:${typeName}`)
-            ?? componentIdByNodeUuidAndType.get(`${binding.nodeUuid}:${shortTypeName(typeName)}`)
-            ?? componentIdByNodeNameAndType.get(`${binding.nodeName}:${typeName}`)
-            ?? componentIdByNodeNameAndType.get(`${binding.nodeName}:${shortTypeName(typeName)}`);
+        const componentId = componentIdsByNodeIdAndType.get(`${targetNodeId}:${typeName}`)
+            ?? componentIdsByNodeIdAndType.get(`${targetNodeId}:${shortTypeName(typeName)}`);
 
         if (componentId !== undefined) {
             targetComponent[binding.propertyName] = { __id__: componentId };
             boundCount += 1;
+        } else {
+            console.warn(`[${PACKAGE_NAME}] Serialized bind missed component ${typeName} on ${binding.nodeName}.`);
         }
     }
 
     writeFileSync(asset.file, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
     return boundCount;
+}
+
+function findSerializedNodeIdByTree(
+    data: any[],
+    rootName: string,
+    selectedChildNames: Set<string>,
+    nodeIdsByName: Map<string, number[]>,
+): number | undefined {
+    const candidates = nodeIdsByName.get(rootName) || [];
+    if (candidates.length === 0) {
+        return undefined;
+    }
+    if (candidates.length === 1) {
+        return candidates[0];
+    }
+
+    let bestId: number | undefined;
+    let bestScore = Number.NEGATIVE_INFINITY;
+
+    for (const nodeId of candidates) {
+        const childNames = getSerializedDirectChildNames(data, nodeId);
+        const matched = childNames.filter((name) => selectedChildNames.has(name)).length;
+        const score = matched * 10 - Math.abs(childNames.length - selectedChildNames.size);
+        if (score > bestScore) {
+            bestScore = score;
+            bestId = nodeId;
+        }
+    }
+
+    return bestId;
+}
+
+function getSerializedDirectChildNames(data: any[], nodeId: number): string[] {
+    const node = data[nodeId];
+    const children = Array.isArray(node?._children) ? node._children : [];
+    return children
+        .map((child: any) => {
+            const childId = child?.__id__;
+            return Number.isInteger(childId) ? String(data[childId]?._name || '') : '';
+        })
+        .filter(Boolean);
+}
+
+function collectSerializedSubtreeNodeIds(data: any[], rootNodeId: number): Set<number> {
+    const result = new Set<number>();
+    const stack = [rootNodeId];
+
+    while (stack.length > 0) {
+        const nodeId = stack.pop();
+        if (nodeId === undefined || result.has(nodeId)) {
+            continue;
+        }
+        result.add(nodeId);
+        const node = data[nodeId];
+        const children = Array.isArray(node?._children) ? node._children : [];
+        for (const child of children) {
+            if (Number.isInteger(child?.__id__)) {
+                stack.push(child.__id__);
+            }
+        }
+    }
+
+    return result;
+}
+
+function resolveSerializedBindingNodeId(
+    data: any[],
+    binding: ScannedBinding,
+    selectedNodeId: number,
+    subtreeNodeIds: Set<number>,
+    nodeIdByUuid: Map<string, number>,
+    nodeIdsByName: Map<string, number[]>,
+): number | undefined {
+    const byUuid = nodeIdByUuid.get(binding.nodeUuid);
+    if (byUuid !== undefined && subtreeNodeIds.has(byUuid)) {
+        return byUuid;
+    }
+
+    const byName = (nodeIdsByName.get(binding.nodeName) || []).filter((id) => subtreeNodeIds.has(id));
+    if (byName.length === 1) {
+        return byName[0];
+    }
+    if (byName.length > 1) {
+        return byName[0];
+    }
+
+    if (binding.nodeName === data[selectedNodeId]?._name) {
+        return selectedNodeId;
+    }
+
+    return undefined;
 }
 
 function getSerializedScriptTypeNames(scriptAsset: any | null, className: string): string[] {
@@ -1664,15 +2406,19 @@ function hasComponent(node: any, componentName: string): boolean {
 }
 
 function matchesComponentName(candidate: string, componentName: string): boolean {
-    const left = candidate.toLowerCase();
-    const right = componentName.toLowerCase();
+    const left = String(candidate || '').trim().toLowerCase();
+    const right = String(componentName || '').trim().toLowerCase();
+    if (!left || !right) {
+        return false;
+    }
+
     const leftShort = shortTypeName(candidate).toLowerCase();
     const rightShort = shortTypeName(componentName).toLowerCase();
 
     return left === right
         || leftShort === rightShort
         || left.endsWith(`.${rightShort}`)
-        || left.includes(right);
+        || right.endsWith(`.${leftShort}`);
 }
 
 async function createComponentWithFallback(nodeUuid: string, componentNames: string[]): Promise<void> {

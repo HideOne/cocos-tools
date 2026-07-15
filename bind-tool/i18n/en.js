@@ -7,5 +7,6 @@ module.exports = {
     generate_and_bind: "Generate and Bind",
     generate_script: "Generate Script",
     bind_references: "Bind References",
+    bind_ui: "Bind UI",
     rules_panel: "Rules",
 };

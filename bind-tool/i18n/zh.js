@@ -7,5 +7,6 @@ module.exports = {
     generate_and_bind: "\u751f\u6210\u5e76\u7ed1\u5b9a",
     generate_script: "\u751f\u6210",
     bind_references: "\u7ed1\u5b9a",
+    bind_ui: "\u7ed1\u5b9aUI",
     rules_panel: "\u89c4\u5219\u914d\u7f6e",
 };

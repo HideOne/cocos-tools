@@ -49,6 +49,11 @@
             },
             {
                 "path": "i18n:menu.extension/i18n:bind-tool.menu",
+                "label": "i18n:bind-tool.bind_ui",
+                "message": "bind-ui-on-selected-node"
+            },
+            {
+                "path": "i18n:menu.extension/i18n:bind-tool.menu",
                 "label": "i18n:bind-tool.rules_panel",
                 "message": "open-rules-panel"
             }
@@ -90,6 +95,11 @@
             "bind-selected-node-references": {
                 "methods": [
                     "bindSelectedNodeReferences"
+                ]
+            },
+            "bind-ui-on-selected-node": {
+                "methods": [
+                    "bindUiOnSelectedNode"
                 ]
             }
         }
